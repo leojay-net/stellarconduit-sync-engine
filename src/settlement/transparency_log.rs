@@ -239,8 +239,8 @@ pub struct ConsistencyProof {
     pub new_root: [u8; 32],
     /// Sub-tree hashes that the verifier uses to reconstruct the old root from
     /// the new tree's leaves.  The hashes decompose `[0, old_size)` into
-    /// maximal power-of-two sub-trees; the verifier chains them left-to-right
-    /// with `node_hash`.
+    /// maximal power-of-two sub-trees; the verifier chains them right-to-left
+    /// with `node_hash` (smallest/rightmost first).
     pub proof_hashes: Vec<[u8; 32]>,
 }
 
@@ -337,7 +337,7 @@ fn collect_subtree_hashes(leaves: &[[u8; 32]], size: usize) -> Vec<[u8; 32]> {
 /// Verify a consistency proof against the new tree's leaves.
 ///
 /// The verifier reconstructs the old root by chaining the proof hashes
-/// left-to-right with `node_hash`, then checks it matches the claimed old root.
+/// right-to-left with `node_hash`, then checks it matches the claimed old root.
 /// It also recomputes the new root from the leaves and checks it matches.
 pub fn verify_consistency_proof(proof: &ConsistencyProof, new_leaves: &[[u8; 32]]) -> bool {
     if proof.old_size == 0 || proof.old_size > proof.new_size {
@@ -349,12 +349,14 @@ pub fn verify_consistency_proof(proof: &ConsistencyProof, new_leaves: &[[u8; 32]
         return proof.old_root == proof.new_root && proof.new_root == expected;
     }
 
-    // Rebuild old root from the proof hashes: chain them left-to-right.
-    // The first hash is the leftmost sub-tree root; each subsequent hash is
-    // hashed with the accumulated result to produce the next larger sub-tree.
-    let mut reconstructed = proof.proof_hashes[0];
-    for hash in &proof.proof_hashes[1..] {
-        reconstructed = node_hash(&reconstructed, hash);
+    // Rebuild old root from the proof hashes: chain them right-to-left.
+    // The last hash is the rightmost (smallest, lowest-level) sub-tree;
+    // each preceding hash is combined to its left to produce the next
+    // larger sub-tree.  This matches the unpadded tree structure where
+    // right-side promotions create right-leaning subtrees.
+    let mut reconstructed = proof.proof_hashes[proof.proof_hashes.len() - 1];
+    for i in (0..proof.proof_hashes.len() - 1).rev() {
+        reconstructed = node_hash(&proof.proof_hashes[i], &reconstructed);
     }
 
     let actual_new_root = root_from_levels(&build_tree_levels(new_leaves));
