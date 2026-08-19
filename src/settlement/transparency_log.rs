@@ -130,7 +130,7 @@ fn build_tree_levels(leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
 
     while levels.last().unwrap().len() > 1 {
         let prev = levels.last().unwrap();
-        let mut next = Vec::with_capacity((prev.len() + 1) / 2);
+        let mut next = Vec::with_capacity(prev.len().div_ceil(2));
         for chunk in prev.chunks(2) {
             if chunk.len() == 2 {
                 next.push(node_hash(&chunk[0], &chunk[1]));
@@ -188,7 +188,7 @@ fn inclusion_proof_from_levels(
     let mut idx = index;
     // Walk from leaf level up to the root (but not including root itself).
     for level in &levels[..levels.len() - 1] {
-        let (sibling_idx, is_right) = if idx % 2 == 0 {
+        let (sibling_idx, is_right) = if idx.is_multiple_of(2) {
             (idx + 1, true)
         } else {
             (idx - 1, false)
