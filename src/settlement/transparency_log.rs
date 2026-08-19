@@ -317,7 +317,12 @@ fn collect_subtree_hashes(leaves: &[[u8; 32]], size: usize) -> Vec<[u8; 32]> {
     let mut start = 0;
     while start < size {
         let remaining = size - start;
-        let sub_size = remaining.next_power_of_two() / 2;
+        // Largest power of two <= remaining.
+        let sub_size = if remaining.is_power_of_two() {
+            remaining
+        } else {
+            remaining.next_power_of_two() / 2
+        };
         // Don't exceed the leaf array.
         let actual_size = sub_size.min(leaves.len() - start);
         if actual_size == 0 {
