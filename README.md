@@ -11,6 +11,7 @@ This repository sits directly on top of [`stellarconduit-core`](https://github.c
 - [Overview](#overview)
 - [Architecture](#architecture)
 - [Modules](#modules)
+- [Metrics and differential privacy](#metrics-and-differential-privacy)
 - [Repository Structure](#repository-structure)
 - [Prerequisites](#prerequisites)
 - [Getting Started](#getting-started)
@@ -112,6 +113,40 @@ Detects and (eventually) resolves double-spend conflicts arising from split mesh
 **Key responsibilities:**
 - `detector`: structural detection — two different envelopes claiming the same (account, sequence) slot can never both settle on-chain
 - `resolver`: **the hard, unsolved centerpiece** — deterministic off-chain resolution using timestamps, `RelayChainProof`s, and relay-node consensus. Currently every conflict falls through to `SyncEngineError::UnresolvedConflict`.
+
+---
+
+### `metrics`
+In-process exact counters (`SyncEngineMetrics`) plus the only supported off-device export path, `DpExporter`. Exact per-device counts must not be scraped as-is: on a shared community relay, or anywhere metrics are aggregated centrally, a spike in `disputes_escalated` can reveal that a particular user or terminal is currently in a dispute. See [Metrics and differential privacy](#metrics-and-differential-privacy).
+
+---
+
+## Metrics and differential privacy
+
+`SyncEngineMetrics` keeps exact `AtomicUsize` lifetime totals for the embedding binary's own use. Off-device export goes through `DpExporter`, which releases **windowed event counts** under the Laplace mechanism (`Lap(b = 1/ε)` per coordinate, L1 sensitivity Δ = 1 for one extra event in the window). Lifetime totals are never exported: noisy lifetime counters collapse under repeated Prometheus scrapes (averaging drives the noise to zero), and `rate()` over a noisy counter is dominated by the noise, not the signal.
+
+**Repeated scrapes.** One noisy snapshot is produced per tumbling window and cached. Subsequent scrapes inside that window return the same values and do not spend more privacy budget — a 15-second Prometheus scrape against the default 60-second window costs `ε` once per minute, not once per scrape. By default the number of windows is uncapped: a single event lives in one window, so event-level `(ε, 0)`-DP does not erode as the process runs. Deployments whose threat model is "hide this device's whole activity trace" (user-level composition, `Tε` after T windows) should set `DpExportConfig::with_max_releases`; once the cap is hit the exporter returns an error rather than falling back to the exact counters.
+
+**Picking `ε`.** Mean absolute error of each released coordinate is `1/ε` (before a non-negativity clamp that slightly biases sparse counters upward):
+
+| Config | `ε` | Window | MAE | 95th \|noise\| | Use when |
+|--------|-----|--------|-----|----------------|----------|
+| `DpExportConfig::strict()` | 0.1 | 5 min | 10 | ~30 | Shared community terminals, high-risk deployments |
+| `DpExportConfig::moderate()` (default) | 1.0 | 60 s | 1 | ~3 | Typical relay / wallet. Single events cannot be confirmed; rate changes of ~10+ stay visible |
+| `DpExportConfig::relaxed()` | 2.0 | 15 s | 0.5 | ~1.5 | Scrapes are already aggregated across many devices before anyone looks at them |
+
+```rust
+use stellarconduit_sync_engine::metrics::{DpExportConfig, DpExporter, SyncEngineMetrics};
+
+let metrics = SyncEngineMetrics::default();
+metrics.record_queued();
+
+let exporter = DpExporter::new(DpExportConfig::moderate()).expect("valid config");
+let scrape = exporter.export_prometheus(&metrics).expect("within budget");
+// Serve `scrape` from /metrics. Do not also expose the raw atomics.
+```
+
+The full design rationale (Laplace vs Gaussian, windowed vs lifetime, budget policy and its residual risk) lives in the module docs of `src/metrics.rs`.
 
 ---
 
