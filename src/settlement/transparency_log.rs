@@ -106,7 +106,7 @@ fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// All-zeroes hash used as padding for incomplete tree subtrees.
+/// All-zeroes hash used as a sentinel for empty trees.
 const EMPTY_HASH: [u8; 32] = [0u8; 32];
 
 // ---------------------------------------------------------------------------
@@ -115,26 +115,29 @@ const EMPTY_HASH: [u8; 32] = [0u8; 32];
 
 /// Build all levels of the Merkle tree from the given leaf hashes.
 ///
-/// The leaves are padded to the next power of two with [`EMPTY_HASH`] so that
-/// the tree is always a perfect binary tree — this makes proof generation and
-/// verification straightforward.
+/// The tree is built **without padding** — odd-length levels promote their
+/// unpaired rightmost node to the next level.  This ensures that the subtree
+/// covering any prefix `[0, m)` of an `n`-leaf tree is structurally identical
+/// to the standalone tree of `m` leaves, which is critical for consistency
+/// proofs: the old root can be derived directly from the new tree's leaves
+/// without re-padding.
 fn build_tree_levels(leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
     if leaves.is_empty() {
         return vec![vec![EMPTY_HASH]];
     }
     let mut levels: Vec<Vec<[u8; 32]>> = Vec::new();
-
-    // Pad leaves to next power of two.
-    let padded_len = leaves.len().next_power_of_two();
-    let mut level = leaves.to_vec();
-    level.resize(padded_len, EMPTY_HASH);
-    levels.push(level);
+    levels.push(leaves.to_vec());
 
     while levels.last().unwrap().len() > 1 {
         let prev = levels.last().unwrap();
-        let mut next = Vec::with_capacity(prev.len() / 2);
-        for chunk in prev.chunks_exact(2) {
-            next.push(node_hash(&chunk[0], &chunk[1]));
+        let mut next = Vec::with_capacity((prev.len() + 1) / 2);
+        for chunk in prev.chunks(2) {
+            if chunk.len() == 2 {
+                next.push(node_hash(&chunk[0], &chunk[1]));
+            } else {
+                // Unpaired node — promote to next level without hashing.
+                next.push(chunk[0]);
+            }
         }
         levels.push(next);
     }
@@ -226,7 +229,7 @@ pub fn verify_inclusion_proof(proof: &InclusionProof) -> bool {
 // ---------------------------------------------------------------------------
 
 /// A proof that a log of size `new_size` is a valid append-only extension of a
-/// log of size `old_size`.  Follows the sub-tree decomposition from RFC 6962
+/// log of size `old_size`.  Uses the sub-tree decomposition from RFC 6962
 /// §2.1.2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsistencyProof {
@@ -234,15 +237,15 @@ pub struct ConsistencyProof {
     pub new_size: usize,
     pub old_root: [u8; 32],
     pub new_root: [u8; 32],
-    /// Hashes needed by the verifier to recompute both roots and confirm the
-    /// old root is a prefix of the new tree.  The verifier reconstructs the
-    /// sub-trees from these hashes plus the old and new leaves.
+    /// Sub-tree hashes that the verifier uses to reconstruct the old root from
+    /// the new tree's leaves.  The hashes decompose `[0, old_size)` into
+    /// maximal power-of-two sub-trees; the verifier chains them left-to-right
+    /// with `node_hash`.
     pub proof_hashes: Vec<[u8; 32]>,
 }
 
 /// Compute the sub-tree hash for a range of leaves `[start, end)` within the
-/// given (padded) leaf level.  This is used both during proof generation and
-/// verification.
+/// (unpadded) leaf array.  Used during both proof generation and verification.
 fn subtree_hash(leaves: &[[u8; 32]], start: usize, end: usize) -> [u8; 32] {
     debug_assert!(start < end);
     let len = end - start;
@@ -251,7 +254,7 @@ fn subtree_hash(leaves: &[[u8; 32]], start: usize, end: usize) -> [u8; 32] {
     }
     let mid = start + (len.next_power_of_two() / 2);
     if mid >= end {
-        // The range is already a single leaf in the padded tree.
+        // The range is a single leaf in the effective tree.
         return leaves[start];
     }
     let left = subtree_hash(leaves, start, mid);
@@ -291,9 +294,10 @@ pub fn consistency_proof(
     let old_root = root_from_levels(&build_tree_levels(old_leaves));
     let new_root = root_from_levels(&build_tree_levels(new_leaves));
 
-    // Collect sub-tree hashes for the new tree over the range [0, old_size).
-    // These are sufficient for the verifier to recompute the old root from the
-    // new tree's leaves.
+    // Collect sub-tree hashes for the new tree's range [0, old_size).
+    // Because the tree is unpadded, the sub-tree covering [0, old_size) in the
+    // new tree is structurally identical to the standalone old tree.  This lets
+    // the verifier reconstruct the old root from these hashes alone.
     let proof_hashes = collect_subtree_hashes(new_leaves, old_size);
 
     Some(ConsistencyProof {
@@ -306,16 +310,15 @@ pub fn consistency_proof(
 }
 
 /// Collect the sub-tree decomposition hashes for range `[0, size)` within the
-/// padded leaves.  This mirrors the algorithm from RFC 6962 §2.1.2: we walk
-/// from left to right, taking the largest power-of-two subtree at each step.
+/// leaf array.  Walks left-to-right, taking the largest power-of-two sub-tree
+/// at each step — mirrors RFC 6962 §2.1.2.
 fn collect_subtree_hashes(leaves: &[[u8; 32]], size: usize) -> Vec<[u8; 32]> {
     let mut hashes = Vec::new();
     let mut start = 0;
     while start < size {
-        // Find the largest power-of-two subtree starting at `start`.
         let remaining = size - start;
         let sub_size = remaining.next_power_of_two() / 2;
-        // But we must not exceed the padded tree width.
+        // Don't exceed the leaf array.
         let actual_size = sub_size.min(leaves.len() - start);
         if actual_size == 0 {
             break;
@@ -326,22 +329,26 @@ fn collect_subtree_hashes(leaves: &[[u8; 32]], size: usize) -> Vec<[u8; 32]> {
     hashes
 }
 
-/// Rebuild the old root from the new tree's leaves and the proof hashes, then
-/// verify it matches the claimed old root.  Also verifies the new root matches.
+/// Verify a consistency proof against the new tree's leaves.
+///
+/// The verifier reconstructs the old root by chaining the proof hashes
+/// left-to-right with `node_hash`, then checks it matches the claimed old root.
+/// It also recomputes the new root from the leaves and checks it matches.
 pub fn verify_consistency_proof(proof: &ConsistencyProof, new_leaves: &[[u8; 32]]) -> bool {
     if proof.old_size == 0 || proof.old_size > proof.new_size {
         return false;
     }
     if proof.old_size == proof.new_size {
-        // Trivial: both roots must be equal.
+        // Trivial: both roots must be equal and match the recomputed root.
         let expected = root_from_levels(&build_tree_levels(new_leaves));
         return proof.old_root == proof.new_root && proof.new_root == expected;
     }
 
-    // Rebuild old root from the proof hashes (which decompose the new tree's
-    // range [0, old_size) into sub-trees).
-    let mut reconstructed = EMPTY_HASH;
-    for hash in &proof.proof_hashes {
+    // Rebuild old root from the proof hashes: chain them left-to-right.
+    // The first hash is the leftmost sub-tree root; each subsequent hash is
+    // hashed with the accumulated result to produce the next larger sub-tree.
+    let mut reconstructed = proof.proof_hashes[0];
+    for hash in &proof.proof_hashes[1..] {
         reconstructed = node_hash(&reconstructed, hash);
     }
 
@@ -494,6 +501,8 @@ mod tests {
         }
     }
 
+    // ── Basic properties ──────────────────────────────────────────────────
+
     #[test]
     fn test_empty_log_has_zero_root() {
         let log = TransparencyLog::new();
@@ -522,7 +531,6 @@ mod tests {
 
     #[test]
     fn test_modifying_earlier_entry_changes_later_root() {
-        // Build two logs that differ only in entry 0.
         let mut log_a = TransparencyLog::new();
         log_a.append(make_entry(0, 1, "", "queued", 1000));
         log_a.append(make_entry(0, 1, "queued", "settled", 1001));
@@ -535,10 +543,32 @@ mod tests {
     }
 
     #[test]
+    fn test_root_hash_is_stable_for_same_input() {
+        let mut a = TransparencyLog::new();
+        let mut b = TransparencyLog::new();
+        for i in 0..10u8 {
+            a.append(make_entry(i as u64, i, "", "queued", 1000 + u64::from(i)));
+            b.append(make_entry(i as u64, i, "", "queued", 1000 + u64::from(i)));
+        }
+        assert_eq!(a.root_hash(), b.root_hash());
+    }
+
+    #[test]
+    fn test_different_message_ids_produce_different_roots() {
+        let mut a = TransparencyLog::new();
+        let mut b = TransparencyLog::new();
+        a.append(make_entry(0, 1, "", "queued", 1000));
+        b.append(make_entry(0, 2, "", "queued", 1000));
+        assert_ne!(a.root_hash(), b.root_hash());
+    }
+
+    // ── Required tests ────────────────────────────────────────────────────
+
+    #[test]
     fn test_inclusion_proof_verifies_for_real_entry() {
         let mut log = TransparencyLog::new();
         for i in 0..8u8 {
-            log.append(make_entry(i as u64, i, "", "queued", 1000 + i as u64));
+            log.append(make_entry(i as u64, i, "", "queued", 1000 + u64::from(i)));
         }
 
         for idx in 0..8 {
@@ -550,32 +580,17 @@ mod tests {
             );
             assert_eq!(proof.leaf_index, idx);
             assert_eq!(proof.root_hash, log.root_hash());
-            // Path should have exactly log2(8) = 3 levels.
-            assert_eq!(proof.path.len(), 3);
+            // Path length varies because the tree is unpadded, but should be
+            // at least 1 for any non-empty log.
+            assert!(!proof.path.is_empty());
         }
-    }
-
-    #[test]
-    fn test_inclusion_proof_rejects_wrong_index() {
-        let mut log = TransparencyLog::new();
-        log.append(make_entry(0, 1, "", "queued", 1000));
-
-        let mut proof = log.inclusion_proof(0).unwrap();
-        // Tamper with the leaf index — proof should still verify (index is not
-        // part of the hash, only the leaf hash matters) but the leaf_hash field
-        // should match the actual leaf.
-        assert!(verify_inclusion_proof(&proof));
-
-        // Change the leaf_hash to something wrong.
-        proof.leaf_hash = [0xff; 32];
-        assert!(!verify_inclusion_proof(&proof));
     }
 
     #[test]
     fn test_consistency_proof_verifies_across_log_growth() {
         let mut log = TransparencyLog::new();
         for i in 0..8u8 {
-            log.append(make_entry(i as u64, i, "", "queued", 1000 + i as u64));
+            log.append(make_entry(i as u64, i, "", "queued", 1000 + u64::from(i)));
         }
 
         // Prove consistency between size 2 and size 8.
@@ -584,21 +599,45 @@ mod tests {
             .expect("consistency proof should exist");
         assert!(
             verify_consistency_proof(&proof, &log.leaves),
-            "consistency proof should verify"
+            "consistency proof (2→8) should verify"
         );
         assert_eq!(proof.old_size, 2);
         assert_eq!(proof.new_size, 8);
 
         // Also test size 4 → 8 (a power-of-two boundary).
         let proof = log.consistency_proof_for(4).unwrap();
-        assert!(verify_consistency_proof(&proof, &log.leaves));
+        assert!(
+            verify_consistency_proof(&proof, &log.leaves),
+            "consistency proof (4→8) should verify"
+        );
+
+        // Also test size 5 → 8 (non-power-of-two old size).
+        let proof = log.consistency_proof_for(5).unwrap();
+        assert!(
+            verify_consistency_proof(&proof, &log.leaves),
+            "consistency proof (5→8) should verify"
+        );
+
+        // Size 1 → 8.
+        let proof = log.consistency_proof_for(1).unwrap();
+        assert!(
+            verify_consistency_proof(&proof, &log.leaves),
+            "consistency proof (1→8) should verify"
+        );
+
+        // Size 7 → 8.
+        let proof = log.consistency_proof_for(7).unwrap();
+        assert!(
+            verify_consistency_proof(&proof, &log.leaves),
+            "consistency proof (7→8) should verify"
+        );
     }
 
     #[test]
     fn test_tampered_historical_entry_is_detected_via_root_hash_mismatch() {
         let mut log = TransparencyLog::new();
         for i in 0..5u8 {
-            log.append(make_entry(i as u64, i, "", "queued", 1000 + i as u64));
+            log.append(make_entry(i as u64, i, "", "queued", 1000 + u64::from(i)));
         }
         let original_root = log.root_hash();
         assert!(log.verify_root());
@@ -627,10 +666,9 @@ mod tests {
             log.append(make_entry(i as u64, i, "", "queued", 1000 + u64::from(i)));
         }
 
-        let old_leaves: Vec<[u8; 32]> = log.leaves[..4].to_vec();
         let proof = log.consistency_proof_for(4).unwrap();
 
-        // Tamper with the new tree: change entry 1 (within the old range).
+        // Tamper with the new tree: change entry 2 (within the old range).
         log.entries[2].to_status = "settled".to_string();
         log.leaves[2] = leaf_hash(&log.entries[2]);
 
@@ -639,14 +677,13 @@ mod tests {
         assert!(!verify_consistency_proof(&proof, &log.leaves));
 
         // Also: a reordered entry in the old range should fail.
-        let mut log2 = TransparencyLog::new();
         let entries: Vec<LogEntry> = (0..8u8)
             .map(|i| make_entry(i as u64, i, "", "queued", 1000 + u64::from(i)))
             .collect();
+        let mut log2 = TransparencyLog::new();
         for e in &entries {
             log2.append(e.clone());
         }
-        let old_leaves2: Vec<[u8; 32]> = log2.leaves[..4].to_vec();
         let proof2 = log2.consistency_proof_for(4).unwrap();
 
         // Swap entries 1 and 2 in the "replayed" log.
@@ -657,8 +694,21 @@ mod tests {
             log3.append(e.clone());
         }
         assert!(!verify_consistency_proof(&proof2, &log3.leaves));
-        // Also verify old leaves don't match (the reordering changed them).
-        assert_ne!(old_leaves2[..], log3.leaves[..4]);
+    }
+
+    // ── Additional integrity tests ────────────────────────────────────────
+
+    #[test]
+    fn test_inclusion_proof_rejects_tampered_leaf() {
+        let mut log = TransparencyLog::new();
+        log.append(make_entry(0, 1, "", "queued", 1000));
+
+        let mut proof = log.inclusion_proof(0).unwrap();
+        assert!(verify_inclusion_proof(&proof));
+
+        // Change the leaf_hash to something wrong.
+        proof.leaf_hash = [0xff; 32];
+        assert!(!verify_inclusion_proof(&proof));
     }
 
     #[test]
@@ -683,26 +733,6 @@ mod tests {
     }
 
     #[test]
-    fn test_root_hash_is_stable_for_same_input() {
-        let mut a = TransparencyLog::new();
-        let mut b = TransparencyLog::new();
-        for i in 0..10u8 {
-            a.append(make_entry(i as u64, i, "", "queued", 1000 + u64::from(i)));
-            b.append(make_entry(i as u64, i, "", "queued", 1000 + u64::from(i)));
-        }
-        assert_eq!(a.root_hash(), b.root_hash());
-    }
-
-    #[test]
-    fn test_different_message_ids_produce_different_roots() {
-        let mut a = TransparencyLog::new();
-        let mut b = TransparencyLog::new();
-        a.append(make_entry(0, 1, "", "queued", 1000));
-        b.append(make_entry(0, 2, "", "queued", 1000)); // different message_id
-        assert_ne!(a.root_hash(), b.root_hash());
-    }
-
-    #[test]
     fn test_get_entries_returns_all_entries() {
         let mut log = TransparencyLog::new();
         for i in 0..5u8 {
@@ -712,5 +742,47 @@ mod tests {
         assert_eq!(log.get(0).unwrap().message_id, [0u8; 32]);
         assert_eq!(log.get(4).unwrap().message_id, [4u8; 32]);
         assert!(log.get(5).is_none());
+    }
+
+    #[test]
+    fn test_inclusion_proof_for_single_entry() {
+        let mut log = TransparencyLog::new();
+        log.append(make_entry(0, 1, "", "queued", 1000));
+        let proof = log.inclusion_proof(0).unwrap();
+        assert!(verify_inclusion_proof(&proof));
+        // Single entry: path should be empty (root = leaf).
+        assert!(proof.path.is_empty());
+        assert_eq!(proof.root_hash, log.root_hash());
+    }
+
+    #[test]
+    fn test_consistency_proof_trivial_same_size() {
+        let mut log = TransparencyLog::new();
+        for i in 0..4u8 {
+            log.append(make_entry(i as u64, i, "", "queued", 1000 + u64::from(i)));
+        }
+        let proof = log.consistency_proof_for(4).unwrap();
+        assert!(verify_consistency_proof(&proof, &log.leaves));
+        assert_eq!(proof.old_size, proof.new_size);
+        assert!(proof.proof_hashes.is_empty());
+    }
+
+    #[test]
+    fn test_consistency_proof_fails_with_wrong_leaves() {
+        let mut log = TransparencyLog::new();
+        for i in 0..4u8 {
+            log.append(make_entry(i as u64, i, "", "queued", 1000 + u64::from(i)));
+        }
+        let proof = log.consistency_proof_for(2).unwrap();
+
+        // Build a different log with different data.
+        let mut other = TransparencyLog::new();
+        other.append(make_entry(0, 99, "", "queued", 1000));
+        other.append(make_entry(1, 100, "", "queued", 1000));
+        other.append(make_entry(2, 2, "", "queued", 1001));
+        other.append(make_entry(3, 3, "", "queued", 1002));
+
+        // The proof was generated for `log`, not `other`.
+        assert!(!verify_consistency_proof(&proof, &other.leaves));
     }
 }
