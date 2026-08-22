@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use tokio_rusqlite::Connection;
 
 use stellarconduit_core::message::relay_proof::RelayChainProof;
@@ -14,6 +15,17 @@ use crate::conflict::{Conflict, DisputeEscalation};
 use crate::errors::SyncEngineError;
 use crate::queue::TxPriority;
 use crate::settlement::SettlementStatus;
+
+/// Version tag embedded in every [`SyncEngineDb::export_snapshot`] output and
+/// checked by [`SyncEngineDb::import_snapshot`].
+///
+/// Issue #11 ("Implement Schema Versioning and Migrations for SyncEngineDb")
+/// had not landed when this was written, so this is a minimal, standalone
+/// version tag scoped to the snapshot format rather than a general schema
+/// migration scheme. If/when #11 lands, this constant should be replaced
+/// with (or defined in terms of) its schema version rather than kept as a
+/// second, competing version number.
+pub const DB_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
 pub struct SyncEngineDb {
     conn: Connection,
@@ -83,6 +95,110 @@ pub struct PersistedEscalation {
     pub envelope_b: [u8; 32],
     pub escalation: DisputeEscalation,
     pub created_at: u64,
+}
+
+/// Outcome of [`SyncEngineDb::import_snapshot`]: how many rows were restored
+/// into each table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ImportReport {
+    pub queued_envelopes_imported: usize,
+    pub settlement_status_imported: usize,
+    pub sequence_reservations_imported: usize,
+    pub conflicts_imported: usize,
+    pub settlement_history_imported: usize,
+    pub dispute_escalations_imported: usize,
+}
+
+// ── Snapshot row types ──────────────────────────────────────────────────
+//
+// These mirror each table's columns directly (rather than the domain types
+// like `Conflict`/`DisputeEscalation` used elsewhere in this file) so that
+// `export_snapshot`/`import_snapshot` round-trip the exact bytes SQLite
+// holds — including opaque columns like `envelope_bytes` and `proof_bytes`
+// — without a re-encode step that could silently normalize or lose data.
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct QueuedEnvelopeRow {
+    message_id: Vec<u8>,
+    source_account: String,
+    sequence: i64,
+    priority: i64,
+    enqueued_at: i64,
+    envelope_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SettlementStatusRow {
+    message_id: Vec<u8>,
+    status: String,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SequenceReservationRow {
+    source_account: String,
+    last_reserved: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ConflictRow {
+    id: i64,
+    source_account: String,
+    sequence: i64,
+    envelope_a: Vec<u8>,
+    envelope_b: Vec<u8>,
+    detected_at: i64,
+    resolved: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SettlementHistoryRow {
+    id: i64,
+    message_id: Vec<u8>,
+    from_status: String,
+    to_status: String,
+    timestamp: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct DisputeEscalationRow {
+    id: i64,
+    source_account: String,
+    sequence: i64,
+    envelope_a: Vec<u8>,
+    envelope_b: Vec<u8>,
+    initiator: String,
+    respondent: String,
+    tx_id: Vec<u8>,
+    proof_bytes: Vec<u8>,
+    created_at: i64,
+    submitted: i64,
+}
+
+/// The full portable contents of a [`SyncEngineDb`], as produced by
+/// [`SyncEngineDb::export_snapshot`] and consumed by
+/// [`SyncEngineDb::import_snapshot`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct DbSnapshot {
+    schema_version: u32,
+    queued_envelopes: Vec<QueuedEnvelopeRow>,
+    settlement_status: Vec<SettlementStatusRow>,
+    sequence_reservations: Vec<SequenceReservationRow>,
+    conflicts: Vec<ConflictRow>,
+    settlement_history: Vec<SettlementHistoryRow>,
+    dispute_escalations: Vec<DisputeEscalationRow>,
+}
+
+/// Result of attempting the transactional half of an import: whether the
+/// database turned out to be non-empty is decided *inside* the same
+/// transaction that would otherwise perform the insert, so there is no
+/// window between a separate "is it empty?" check and the insert itself in
+/// which a concurrent writer could sneak in a row (this matters because
+/// `SyncEngineDb` is designed to be shared behind an `Arc` across
+/// concurrent callers — see `test_escalation_survives_conflicting_concurrent_writes`).
+enum ImportOutcome {
+    Imported(ImportReport),
+    TargetNotEmpty,
 }
 
 impl SyncEngineDb {
@@ -919,6 +1035,349 @@ impl SyncEngineDb {
         }
 
         Ok(stale_ids)
+    }
+
+    /// Serialize every table in this database into a single portable,
+    /// versioned blob suitable for moving a device's entire sync-engine
+    /// state (pending payments, sequence reservations, unresolved
+    /// conflicts, dispute escalations, settlement history) to another
+    /// device — see issue #15.
+    ///
+    /// # Format and versioning
+    ///
+    /// The blob is a MessagePack-encoded [`DbSnapshot`], tagged with
+    /// [`DB_SNAPSHOT_SCHEMA_VERSION`]. Issue #11 (schema versioning for
+    /// `SyncEngineDb`) had not landed at the time this was written; if it
+    /// lands later, this constant should be unified with its scheme rather
+    /// than kept as a second version number.
+    ///
+    /// # Encryption at rest
+    ///
+    /// This function does **not** encrypt its output. It reads whatever
+    /// plaintext rows the current connection can see and serializes them
+    /// as-is. Issue #12 (encryption at rest for `SyncEngineDb`) had not
+    /// landed at the time this was written; if/when it lands, note that an
+    /// exported snapshot is **not** an encrypted artifact merely because
+    /// the source database is encrypted at rest — encryption at rest
+    /// protects the on-disk SQLite file, not the output of this function.
+    /// A snapshot is exactly as sensitive as the payment history it
+    /// contains (source accounts, sequence numbers, full transaction
+    /// envelopes, dispute proofs) and must be treated as plaintext
+    /// financial data by callers: transmit it only over an encrypted
+    /// channel (e.g. a direct authenticated device-to-device transfer) and
+    /// do not persist it unencrypted at rest. Wrapping the returned bytes
+    /// in caller-side encryption (ideally using the same key material as
+    /// #12's at-rest encryption, so a snapshot is never a plaintext copy of
+    /// something the source database was encrypting) is recommended but
+    /// intentionally left to the caller, since #15 is independent of #12
+    /// and the two may land in either order.
+    ///
+    /// # Sequence reservations
+    ///
+    /// `sequence_reservations` rows are exported and imported as-is. A
+    /// sequence baseline reserved on the source device may be stale by the
+    /// time it reaches the target device (e.g. the account transacted from
+    /// elsewhere in the interim) — see issue #8. **Callers must run stale
+    /// sequence reconciliation immediately after [`Self::import_snapshot`]
+    /// returns and before queuing anything new**; this function does not
+    /// (and cannot, without live network access to the account) validate
+    /// the reservation against current on-chain state itself.
+    pub async fn export_snapshot(&self) -> Result<Vec<u8>, SyncEngineError> {
+        let snapshot = self
+            .conn
+            .call(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT message_id, source_account, sequence, priority, enqueued_at, envelope_bytes
+                     FROM queued_envelopes",
+                )?;
+                let queued_envelopes = stmt
+                    .query_map([], |row| {
+                        Ok(QueuedEnvelopeRow {
+                            message_id: row.get(0)?,
+                            source_account: row.get(1)?,
+                            sequence: row.get(2)?,
+                            priority: row.get(3)?,
+                            enqueued_at: row.get(4)?,
+                            envelope_bytes: row.get(5)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+                let mut stmt = conn
+                    .prepare("SELECT message_id, status, updated_at FROM settlement_status")?;
+                let settlement_status = stmt
+                    .query_map([], |row| {
+                        Ok(SettlementStatusRow {
+                            message_id: row.get(0)?,
+                            status: row.get(1)?,
+                            updated_at: row.get(2)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+                let mut stmt = conn
+                    .prepare("SELECT source_account, last_reserved FROM sequence_reservations")?;
+                let sequence_reservations = stmt
+                    .query_map([], |row| {
+                        Ok(SequenceReservationRow {
+                            source_account: row.get(0)?,
+                            last_reserved: row.get(1)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+                let mut stmt = conn.prepare(
+                    "SELECT id, source_account, sequence, envelope_a, envelope_b, detected_at, resolved
+                     FROM conflicts",
+                )?;
+                let conflicts = stmt
+                    .query_map([], |row| {
+                        Ok(ConflictRow {
+                            id: row.get(0)?,
+                            source_account: row.get(1)?,
+                            sequence: row.get(2)?,
+                            envelope_a: row.get(3)?,
+                            envelope_b: row.get(4)?,
+                            detected_at: row.get(5)?,
+                            resolved: row.get(6)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+                let mut stmt = conn.prepare(
+                    "SELECT id, message_id, from_status, to_status, timestamp
+                     FROM settlement_history",
+                )?;
+                let settlement_history = stmt
+                    .query_map([], |row| {
+                        Ok(SettlementHistoryRow {
+                            id: row.get(0)?,
+                            message_id: row.get(1)?,
+                            from_status: row.get(2)?,
+                            to_status: row.get(3)?,
+                            timestamp: row.get(4)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+                let mut stmt = conn.prepare(
+                    "SELECT id, source_account, sequence, envelope_a, envelope_b, initiator,
+                            respondent, tx_id, proof_bytes, created_at, submitted
+                     FROM dispute_escalations",
+                )?;
+                let dispute_escalations = stmt
+                    .query_map([], |row| {
+                        Ok(DisputeEscalationRow {
+                            id: row.get(0)?,
+                            source_account: row.get(1)?,
+                            sequence: row.get(2)?,
+                            envelope_a: row.get(3)?,
+                            envelope_b: row.get(4)?,
+                            initiator: row.get(5)?,
+                            respondent: row.get(6)?,
+                            tx_id: row.get(7)?,
+                            proof_bytes: row.get(8)?,
+                            created_at: row.get(9)?,
+                            submitted: row.get(10)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+                Ok(DbSnapshot {
+                    schema_version: DB_SNAPSHOT_SCHEMA_VERSION,
+                    queued_envelopes,
+                    settlement_status,
+                    sequence_reservations,
+                    conflicts,
+                    settlement_history,
+                    dispute_escalations,
+                })
+            })
+            .await?;
+
+        Ok(rmp_serde::to_vec(&snapshot)?)
+    }
+
+    /// Restore a snapshot produced by [`Self::export_snapshot`] into this
+    /// database — see issue #15.
+    ///
+    /// # Import policy: reject into a non-empty database
+    ///
+    /// This function **rejects the import with
+    /// [`SyncEngineError::ImportTargetNotEmpty`] if any table in this
+    /// database already contains a row.** It does not merge or overwrite.
+    ///
+    /// This was chosen over merge/overwrite because every table here
+    /// guards financial or double-spend-sensitive state: silently merging
+    /// two `sequence_reservations` for the same account, or two
+    /// `queued_envelopes`/`conflicts` rows, requires a conflict-resolution
+    /// policy no less complex than the one `crate::conflict` already exists
+    /// to implement for on-chain envelopes — inventing a second, weaker one
+    /// just for import would risk exactly the double-spend and
+    /// lost-payment hazards this crate is otherwise built to prevent.
+    /// Reject-if-nonempty keeps the operation's outcome trivially provable
+    /// (empty + snapshot = snapshot, exactly) and matches the intended
+    /// use case described in issue #15: restoring onto a new device, whose
+    /// database is normally fresh. A caller that genuinely needs to
+    /// combine two non-empty databases should do so explicitly at a higher
+    /// level, not implicitly inside this function.
+    ///
+    /// The emptiness check and the insert happen inside the same SQLite
+    /// transaction, so a concurrent write landing between "check" and
+    /// "insert" cannot cause a corrupt or partial import.
+    ///
+    /// # Corrupted or truncated input
+    ///
+    /// A `data` that is not a valid, complete [`DbSnapshot`] encoding fails
+    /// with [`SyncEngineError::DeserializationError`] before anything is
+    /// written — there is no partial-write state to worry about.
+    ///
+    /// # Schema version
+    ///
+    /// A snapshot whose embedded version does not match
+    /// [`DB_SNAPSHOT_SCHEMA_VERSION`] is rejected with
+    /// [`SyncEngineError::IncompatibleSnapshotSchemaVersion`] rather than
+    /// imported speculatively.
+    ///
+    /// # Sequence reservations and encryption at rest
+    ///
+    /// See [`Self::export_snapshot`]'s documentation for the recommended
+    /// post-import reconciliation flow (issue #8) and this format's
+    /// relationship to encryption at rest (issue #12).
+    pub async fn import_snapshot(&self, data: &[u8]) -> Result<ImportReport, SyncEngineError> {
+        let snapshot: DbSnapshot = rmp_serde::from_slice(data)?;
+
+        if snapshot.schema_version != DB_SNAPSHOT_SCHEMA_VERSION {
+            return Err(SyncEngineError::IncompatibleSnapshotSchemaVersion {
+                found: snapshot.schema_version,
+                expected: DB_SNAPSHOT_SCHEMA_VERSION,
+            });
+        }
+
+        let outcome = self
+            .conn
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+
+                let existing_rows: i64 = tx.query_row(
+                    "SELECT
+                        (SELECT COUNT(*) FROM queued_envelopes) +
+                        (SELECT COUNT(*) FROM settlement_status) +
+                        (SELECT COUNT(*) FROM sequence_reservations) +
+                        (SELECT COUNT(*) FROM conflicts) +
+                        (SELECT COUNT(*) FROM settlement_history) +
+                        (SELECT COUNT(*) FROM dispute_escalations)",
+                    [],
+                    |row| row.get(0),
+                )?;
+
+                if existing_rows != 0 {
+                    return Ok(ImportOutcome::TargetNotEmpty);
+                }
+
+                for row in &snapshot.queued_envelopes {
+                    tx.execute(
+                        "INSERT INTO queued_envelopes
+                            (message_id, source_account, sequence, priority, enqueued_at, envelope_bytes)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            row.message_id,
+                            row.source_account,
+                            row.sequence,
+                            row.priority,
+                            row.enqueued_at,
+                            row.envelope_bytes
+                        ],
+                    )?;
+                }
+
+                for row in &snapshot.settlement_status {
+                    tx.execute(
+                        "INSERT INTO settlement_status (message_id, status, updated_at)
+                         VALUES (?1, ?2, ?3)",
+                        rusqlite::params![row.message_id, row.status, row.updated_at],
+                    )?;
+                }
+
+                for row in &snapshot.sequence_reservations {
+                    tx.execute(
+                        "INSERT INTO sequence_reservations (source_account, last_reserved)
+                         VALUES (?1, ?2)",
+                        rusqlite::params![row.source_account, row.last_reserved],
+                    )?;
+                }
+
+                for row in &snapshot.conflicts {
+                    tx.execute(
+                        "INSERT INTO conflicts
+                            (id, source_account, sequence, envelope_a, envelope_b, detected_at, resolved)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        rusqlite::params![
+                            row.id,
+                            row.source_account,
+                            row.sequence,
+                            row.envelope_a,
+                            row.envelope_b,
+                            row.detected_at,
+                            row.resolved
+                        ],
+                    )?;
+                }
+
+                for row in &snapshot.settlement_history {
+                    tx.execute(
+                        "INSERT INTO settlement_history
+                            (id, message_id, from_status, to_status, timestamp)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![
+                            row.id,
+                            row.message_id,
+                            row.from_status,
+                            row.to_status,
+                            row.timestamp
+                        ],
+                    )?;
+                }
+
+                for row in &snapshot.dispute_escalations {
+                    tx.execute(
+                        "INSERT INTO dispute_escalations
+                            (id, source_account, sequence, envelope_a, envelope_b, initiator,
+                             respondent, tx_id, proof_bytes, created_at, submitted)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        rusqlite::params![
+                            row.id,
+                            row.source_account,
+                            row.sequence,
+                            row.envelope_a,
+                            row.envelope_b,
+                            row.initiator,
+                            row.respondent,
+                            row.tx_id,
+                            row.proof_bytes,
+                            row.created_at,
+                            row.submitted
+                        ],
+                    )?;
+                }
+
+                tx.commit()?;
+
+                Ok(ImportOutcome::Imported(ImportReport {
+                    queued_envelopes_imported: snapshot.queued_envelopes.len(),
+                    settlement_status_imported: snapshot.settlement_status.len(),
+                    sequence_reservations_imported: snapshot.sequence_reservations.len(),
+                    conflicts_imported: snapshot.conflicts.len(),
+                    settlement_history_imported: snapshot.settlement_history.len(),
+                    dispute_escalations_imported: snapshot.dispute_escalations.len(),
+                }))
+            })
+            .await?;
+
+        match outcome {
+            ImportOutcome::Imported(report) => Ok(report),
+            ImportOutcome::TargetNotEmpty => Err(SyncEngineError::ImportTargetNotEmpty),
+        }
     }
 }
 
