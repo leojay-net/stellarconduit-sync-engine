@@ -1,78 +1,62 @@
-# Verifiable-Delay-Function-Based Fair Dispatch Ordering
+# Database Export/Import for Device Migration
 
-Addresses #64.
+Addresses #15.
 
-## Scope note (read this first)
+## Problem
 
-This issue explicitly asks for a design discussion before implementation and flags that "a realistic and honestly-reported negative or partial result is a legitimate, valuable outcome here." In that spirit, this PR ships a **documented reference prototype**, not a production security claim — the mechanism, the four required tests, and real measured costs, alongside an explicit, precise account of what it does and does not guarantee (including the one significant gap that keeps it from being adversarially deployable as-is). See `src/queue/vdf_ordering.rs`'s module doc comment for the full design discussion; this description summarizes it.
+There was no way to move a `SyncEngineDb`'s state — pending payments, sequence reservations, unresolved conflicts, dispute escalations, settlement history — from one device to another. For the population StellarConduit targets (disaster-relief/displacement scenarios), losing that state because a phone was lost, broken, or replaced means losing pending offline payments that may represent emergency funds.
 
 ## What's here
 
-`src/queue/vdf_ordering.rs` implements a **Wesolowski VDF**: a prover computes `y = x^(2^T) mod N` via `T` sequential modular squarings (no known shortcut without factoring `N`), plus a Fiat-Shamir proof `π` that lets a verifier check the result in `O(log T)` group operations instead of redoing the `T` squarings.
+Two new methods on `SyncEngineDb` (`src/storage/db.rs`):
 
-- `VdfParams::generate` — builds a fresh RSA-style modulus + delay parameter.
-- `evaluate` / `verify` — produce and check a `VdfProof`, binding the input to an `epoch_seed` (see below).
-- `VdfOrderedEntry` / `sort_for_dispatch` — a sibling ordering function for `OutboundTxQueue`'s priority tiers, described below.
+- `export_snapshot(&self) -> Result<Vec<u8>, SyncEngineError>` — serializes every table into a single versioned MessagePack blob.
+- `import_snapshot(&self, data: &[u8]) -> Result<ImportReport, SyncEngineError>` — restores a blob produced by `export_snapshot` into this database.
 
-## Why Wesolowski, and why not more
+Snapshot rows mirror table columns directly (rather than going through the domain types used elsewhere in this file, e.g. `Conflict`/`DisputeEscalation`), so the round-trip is byte-exact instead of passing through a second encode/decode step that could silently normalize or lose data.
 
-Chosen over Pietrzak's construction (similar prover cost, but `O(log T)` proof *rounds* instead of one Fiat-Shamir challenge) and over a class-group instantiation (no trusted setup needed, but implementing class-group arithmetic from scratch is a much larger and riskier surface than this scope). References: Wesolowski, *Efficient Verifiable Delay Functions*, EUROCRYPT 2019; Pietrzak, *Simple Verifiable Delay Functions*, ITCS 2019; Boneh/Bünz/Fisch, *A Survey of Two Verifiable Delay Functions*, 2018.
+## Versioning (issue #11)
 
-## The one gap that matters most: trusted setup
+Issue #11 (schema versioning/migrations for `SyncEngineDb`) hadn't landed at the time this was picked up, so this adds its own minimal, standalone tag — `DB_SNAPSHOT_SCHEMA_VERSION` — scoped only to the snapshot format, rather than inventing a general migration scheme. `import_snapshot` rejects any blob whose embedded version doesn't match, via a new `SyncEngineError::IncompatibleSnapshotSchemaVersion`. If #11 lands later, this constant should be unified with its scheme, not kept as a second, competing version number.
 
-Wesolowski's construction over `Z/NZ` is only sound if nobody knows `N`'s factorization — knowing `p, q` lets you compute `φ(N)` and shortcut the whole delay via a single fast modular exponentiation. Real deployments solve this with a class-group construction or an elaborate multi-party ceremony. **`VdfParams::generate` does neither** — it generates `p, q` locally, so whoever calls it knows the factorization. This is fine for local testing/demonstration, explicitly **not sound for an adversarial multi-device deployment**.
+## Import policy: reject into a non-empty database
 
-I looked for a way to ship a modulus nobody knows the factorization of (e.g. a public RSA Factoring Challenge number) but had no reliable way, in this environment, to transcribe a 617-digit constant with the certainty a security-critical constant deserves — one fetch attempt via a web tool actually corrupted/duplicated the real RSA-2048 number into an ~8,700-character garbage string mid-summarization, which is exactly the failure mode that makes "trust me, I copied it right" unacceptable here. Shipping an unverifiable guess would be worse than shipping nothing, so this prototype ships no production-grade modulus. Closing this gap (via a class-group implementation or a verified trusted-setup modulus) is the single largest remaining piece of work before this scheme is usable between mutually distrusting devices.
+`import_snapshot` **rejects the import** (`SyncEngineError::ImportTargetNotEmpty`) if the target database already contains any rows, in any table. It does not merge or overwrite.
 
-## Binding to real time
+This was a deliberate choice over merge/overwrite: every table here guards financial or double-spend-sensitive state. Silently merging two `sequence_reservations` rows for the same account, or two `conflicts`/`queued_envelopes` rows, would need a conflict-resolution policy no less complex than the one `crate::conflict` already exists to implement for on-chain envelopes — inventing a second, weaker one just for import risks the exact double-spend and lost-payment hazards this crate is otherwise built to prevent. Reject-if-nonempty keeps the outcome trivially provable (`empty + snapshot = snapshot`, exactly) and matches the issue's intended use case: restoring onto a new device, whose database is normally fresh.
 
-A VDF alone only proves "at least `T` sequential steps elapsed since `x` was fixed" — nothing about calendar time unless `x` is bound to something the prover couldn't have known in advance. Deriving `x` purely from the envelope's own content would be a critical flaw: a device could precompute a proof for a transaction it hasn't queued yet, at its leisure. `evaluate`/`verify` require an explicit `epoch_seed` — an unpredictable value published by the relay/mesh at the start of a dispatch round (a natural candidate already in this crate: `TransparencyLog`'s root hash at round start). This module implements the binding; it does **not** implement the round/epoch-seed distribution protocol itself, which belongs to the mesh/relay networking layer, not this crate.
+The emptiness check and the row inserts happen inside a single SQLite transaction, so a concurrent writer landing between "check" and "insert" can't produce a partial or corrupt import — `SyncEngineDb` is designed to be shared behind an `Arc` across concurrent callers, so this isn't a hypothetical.
 
-## Integration with `OutboundTxQueue`
+## Interaction with encryption at rest (issue #12)
 
-`OutboundTxQueue` itself is untouched — its `BinaryHeap`/`Ord` machinery and Emergency-guard logic are already covered by an extensive existing test suite, and this feature only matters in the shared-relay/multi-device fairness context. `VdfOrderedEntry` + `sort_for_dispatch` provide a sibling ordering function reusing the identical `TxPriority` tiering: priority still dominates absolutely; VDF evidence is only ever a tie-break *within* a tier (an entry with a currently-valid proof beats one without); with no VDF evidence anywhere, ordering falls back to today's self-reported `enqueued_at` FIFO — i.e. unchanged behavior.
+Issue #12 hadn't landed either, so this format has no encryption of its own — `export_snapshot` reads and serializes whatever plaintext rows the connection can see. This is documented explicitly on both functions: **an exported snapshot is not an encrypted artifact merely because the source database is encrypted at rest.** Encryption at rest protects the on-disk SQLite file, not the output of `export_snapshot`. A snapshot is exactly as sensitive as the payment history it contains (source accounts, sequence numbers, full transaction envelopes, dispute proofs) and callers must treat it as plaintext financial data: transmit only over an encrypted channel, don't persist it unencrypted at rest, and ideally wrap it in caller-side encryption (using the same key material as #12's at-rest encryption, so a snapshot is never a plaintext copy of something the source database was encrypting) before writing it anywhere.
 
-## Guarantees / non-guarantees (verbatim from the module docs)
+## Interaction with stale sequence reservations (issue #8)
 
-**Guarantees:**
-- A verifier trusting none of the prover's clock/logs/self-reports can check, in `O(log T)`, whether the prover performed at least `T` sequential squarings binding a specific envelope to a specific epoch seed.
-- A party who performed fewer than `T` sequential squarings cannot produce a proof a `T`-configured verifier accepts (see the caveat above for how this prototype's own modulus undermines that claim).
-- Because `x` is bound to `epoch_seed`, no device can have begun a valid computation before that seed was published.
+`sequence_reservations` rows are exported and imported as-is. A sequence baseline reserved on the source device may be stale by the time it reaches the target device (e.g. the account transacted from elsewhere in the interim). This is documented as a required post-import step, not implemented here: **callers must run stale-sequence reconciliation (#8) immediately after `import_snapshot` returns and before queuing anything new** — this function has no live network access to the account and can't validate the reservation itself.
 
-**Non-guarantees:**
-- Not an upper bound — a device can finish early and simply withhold submission.
-- Not parallelism-proof against a well-resourced adversary running multiple separate proofs concurrently.
-- Not calibrated against ASICs/optimized implementations (this is unoptimized pure-Rust `num-bigint`).
-- Not sound against a party using its own self-generated modulus (see "trusted setup" above).
-- Says nothing about which envelope a device chooses to compute a proof for, or whether it ever submits one.
+## Corrupted / truncated input
 
-## Measured costs
-
-`measure_vdf_squaring_throughput` times 1024-bit modular squarings and reports µs/squaring. Actually measured on the (shared, virtualized) machine used to build this, single-threaded, unoptimized `num-bigint`:
-
-| build     | measured cost per 1024-bit squaring |
-|-----------|--------------------------------------|
-| `debug`   | ~24–26 µs |
-| `release` | ~1.8 µs |
-
-Release optimization alone bought ~14x here — a concrete illustration of why "T sequential steps" is a more defensible delay unit than "T seconds." These numbers are an explicit same-order-of-magnitude proxy, not a mobile-calibrated figure: real mobile SoCs vary enormously, and GMP/assembly-backed bignum libraries (as real VDF deployments use) are known to run well over an order of magnitude faster for this workload. An honest mobile-calibrated delay parameter would require running this on representative target devices, which wasn't possible in this environment.
+A `data` blob that isn't a valid, complete snapshot encoding fails with `SyncEngineError::DeserializationError` before anything is written — there's no partial-write state to reason about, and no panic path.
 
 ## Testing
 
-Required tests, all in `src/queue/vdf_ordering.rs`:
-- `test_vdf_proof_verifies_for_honest_evaluation`
-- `test_backdated_proof_is_rejected` — a party that only performed a fraction of the required sequential work cannot produce a proof that verifies against the full required delay, even though its own smaller-delay proof is valid on its own terms.
-- `test_vdf_evaluation_time_matches_configured_delay_parameter` — asserts evaluation time scales with the delay parameter (proportionality, not an absolute bound, to stay robust across hardware — tolerance widened to accommodate this sandbox's scheduling noise).
-- `test_ordering_integration_preserves_priority_tier_semantics` — priority tier dominates absolutely regardless of VDF evidence or self-reported timestamps; VDF evidence only tie-breaks within a tier.
-
-Plus supporting tests: Miller-Rabin sanity against known primes/composites, hash-to-prime determinism, and a check that with no VDF evidence anywhere, ordering is unchanged from today's FIFO.
+Required tests, all in `src/storage/db.rs`:
+- `test_export_import_roundtrip_is_lossless` — seeds every table, exports, imports into a fresh database, and asserts every table matches exactly (including `DbSummary`, ordered comparisons for envelopes/conflicts/escalations/history/reservations).
+- `test_import_into_nonempty_db_follows_documented_policy` — importing into a database with existing rows returns `ImportTargetNotEmpty`, and neither the target's pre-existing rows nor the snapshot's rows are mutated.
+- `test_import_rejects_corrupted_snapshot` — both garbage bytes and a truncated real snapshot fail with `DeserializationError`, and nothing is written either time.
+- `test_import_rejects_incompatible_schema_version` — a snapshot tagged with `DB_SNAPSHOT_SCHEMA_VERSION + 1` is rejected with `IncompatibleSnapshotSchemaVersion` before any table is touched.
 
 ```
-cargo fmt --all -- --check         # clean
-cargo clippy --all-targets --all-features -- -D warnings   # clean
-cargo test                          # 181 passed, 0 failed
+cargo fmt --all -- --check                          # clean
+cargo clippy --all-targets -- -D warnings           # clean
+cargo test                                           # 172 unit + 13 integration passed, 0 failed
 ```
 
-## Commit
+Note: this repo's pinned `stellarconduit-core` git dependency fails to build natively on macOS (`mdns-sd` is gated to `cfg(target_os = "linux")` in its `Cargo.toml`, but two of its modules use it unconditionally with no matching `#[cfg]`). This is pre-existing on `main` and unrelated to this change — verified via a temporary local-only patch to the cached dependency checkout (reverted afterward, nothing in this repo touched) since CI runs on `ubuntu-latest` where it's a non-issue.
 
-1. `feat(queue): add VDF-based dispatch ordering evidence prototype (#64)`
+## Commits
+
+1. `errors: add error variants for snapshot export/import`
+2. `storage: implement snapshot export/import for device migration`
+3. `storage: add required tests for snapshot export/import`
