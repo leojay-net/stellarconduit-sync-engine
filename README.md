@@ -245,6 +245,37 @@ cargo test settlement
 cargo test storage
 ```
 
+### Diagnostic CLI
+
+`sync-engine-cli` is a read-only inspector for a `SyncEngineDb` SQLite file — useful for debugging a real device's local state (what's queued, an envelope's settlement history, unresolved conflicts) without writing a throwaway script or attaching a debugger.
+
+```bash
+cargo build --bin sync-engine-cli
+```
+
+Every subcommand takes `--db-path <PATH>` pointing at the device's `SyncEngineDb` file, and an optional `--json` flag (placed before the subcommand) for machine-readable output instead of a table:
+
+```bash
+# What's currently queued, optionally filtered by account and/or priority
+cargo run --bin sync-engine-cli -- --db-path wallet.sqlite3 queue list
+cargo run --bin sync-engine-cli -- --db-path wallet.sqlite3 queue list --account GABC... --priority emergency
+
+# Settlement status and full history for one message id (hex-encoded, as printed by `queue list`)
+cargo run --bin sync-engine-cli -- --db-path wallet.sqlite3 settlement status <message_id_hex>
+
+# Detected double-spend conflicts
+cargo run --bin sync-engine-cli -- --db-path wallet.sqlite3 conflicts list
+cargo run --bin sync-engine-cli -- --db-path wallet.sqlite3 conflicts list --unresolved-only
+
+# Row counts per table and queue age extremes
+cargo run --bin sync-engine-cli -- --db-path wallet.sqlite3 db summary
+
+# Machine-readable JSON, e.g. for scripting
+cargo run --bin sync-engine-cli -- --db-path wallet.sqlite3 --json queue list
+```
+
+The CLI never writes to the database. Its argument parsing and data assembly live in `src/cli.rs` (exercised directly by `tests/integration/cli_test.rs`); `src/bin/sync-engine-cli.rs` is a thin wrapper over that library code.
+
 ### Linting and Formatting
 
 Always run these before submitting a pull request:
