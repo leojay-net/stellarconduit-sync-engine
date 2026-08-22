@@ -279,3 +279,215 @@ pub async fn db_summary(db: &SyncEngineDb) -> Result<DbSummaryView, CliError> {
         newest_queued_at: s.newest_queued_at,
     })
 }
+
+// ── Rendering ────────────────────────────────────────────────────────────
+
+fn to_json<T: Serialize>(value: &T) -> Result<String, CliError> {
+    Ok(serde_json::to_string_pretty(value)?)
+}
+
+/// Render a simple, aligned table. Shared by every subcommand's
+/// human-readable output.
+fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+
+    let mut out = String::new();
+    let render_row = |cells: &[String], widths: &[usize]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{:width$}", c, width = widths[i]))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+
+    let header_cells: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+    out.push_str(render_row(&header_cells, &widths).trim_end());
+    out.push('\n');
+    out.push_str(
+        &widths
+            .iter()
+            .map(|w| "-".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("  "),
+    );
+    out.push('\n');
+
+    if rows.is_empty() {
+        out.push_str("(no rows)\n");
+    } else {
+        for row in rows {
+            out.push_str(render_row(row, &widths).trim_end());
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+fn render_queue_table(rows: &[QueueEntryView]) -> String {
+    render_table(
+        &[
+            "MESSAGE_ID",
+            "SOURCE_ACCOUNT",
+            "SEQUENCE",
+            "PRIORITY",
+            "ENQUEUED_AT",
+        ],
+        &rows
+            .iter()
+            .map(|r| {
+                vec![
+                    r.message_id.clone(),
+                    r.source_account.clone(),
+                    r.sequence.to_string(),
+                    r.priority.clone(),
+                    r.enqueued_at.to_string(),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn render_settlement_status(view: &SettlementStatusView) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("message_id:     {}\n", view.message_id));
+    out.push_str(&format!(
+        "current_status: {}\n",
+        view.current_status.as_deref().unwrap_or("(untracked)")
+    ));
+    out.push_str("history:\n");
+    out.push_str(&render_table(
+        &["FROM_STATUS", "TO_STATUS", "TIMESTAMP"],
+        &view
+            .history
+            .iter()
+            .map(|h| {
+                vec![
+                    h.from_status.clone(),
+                    h.to_status.clone(),
+                    h.timestamp.to_string(),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    ));
+    out
+}
+
+fn render_conflicts_table(rows: &[ConflictView]) -> String {
+    render_table(
+        &[
+            "ID",
+            "SOURCE_ACCOUNT",
+            "SEQUENCE",
+            "ENVELOPE_A",
+            "ENVELOPE_B",
+            "DETECTED_AT",
+            "RESOLVED",
+        ],
+        &rows
+            .iter()
+            .map(|c| {
+                vec![
+                    c.id.to_string(),
+                    c.source_account.clone(),
+                    c.sequence.to_string(),
+                    c.envelope_a.clone(),
+                    c.envelope_b.clone(),
+                    c.detected_at.to_string(),
+                    c.resolved.to_string(),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn render_summary(view: &DbSummaryView) -> String {
+    format!(
+        "queued_envelopes:      {}\n\
+         settlement_status:     {}\n\
+         sequence_reservations: {}\n\
+         conflicts:             {} ({} unresolved)\n\
+         oldest_queued_at:      {}\n\
+         newest_queued_at:      {}\n",
+        view.queued_envelopes_count,
+        view.settlement_status_count,
+        view.sequence_reservations_count,
+        view.conflicts_count,
+        view.unresolved_conflicts_count,
+        view.oldest_queued_at
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(none)".to_string()),
+        view.newest_queued_at
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(none)".to_string()),
+    )
+}
+
+// ── Dispatch ─────────────────────────────────────────────────────────────
+
+/// Run `command` against `db`, returning the fully rendered output (table or
+/// JSON, per `json`). Split out from [`run`] so tests can drive it directly
+/// against an in-memory or fixture `SyncEngineDb` without touching argv or a
+/// real file path.
+pub async fn dispatch(
+    db: &SyncEngineDb,
+    command: &Command,
+    json: bool,
+) -> Result<String, CliError> {
+    match command {
+        Command::Queue {
+            action: QueueAction::List { account, priority },
+        } => {
+            let rows = queue_list(db, account.as_deref(), priority.map(Into::into)).await?;
+            if json {
+                to_json(&rows)
+            } else {
+                Ok(render_queue_table(&rows))
+            }
+        }
+        Command::Settlement {
+            action: SettlementAction::Status { message_id },
+        } => {
+            let view = settlement_status(db, message_id).await?;
+            if json {
+                to_json(&view)
+            } else {
+                Ok(render_settlement_status(&view))
+            }
+        }
+        Command::Conflicts {
+            action: ConflictsAction::List { unresolved_only },
+        } => {
+            let rows = conflicts_list(db, *unresolved_only).await?;
+            if json {
+                to_json(&rows)
+            } else {
+                Ok(render_conflicts_table(&rows))
+            }
+        }
+        Command::Db {
+            action: DbAction::Summary,
+        } => {
+            let view = db_summary(db).await?;
+            if json {
+                to_json(&view)
+            } else {
+                Ok(render_summary(&view))
+            }
+        }
+    }
+}
+
+/// Open the database at `cli.db_path` and run `cli.command` against it.
+/// Thin entry point for [`crate`]'s `sync-engine-cli` binary; see
+/// [`dispatch`] for the testable core.
+pub async fn run(cli: Cli) -> Result<String, CliError> {
+    let db = SyncEngineDb::init(&cli.db_path).await?;
+    dispatch(&db, &cli.command, cli.json).await
+}
