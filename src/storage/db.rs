@@ -42,6 +42,35 @@ pub struct BatchUpdateReport {
     pub rejected: Vec<([u8; 32], String)>,
 }
 
+/// A single recorded double-spend conflict, as durably stored — unlike
+/// [`Conflict`] (which only carries the (account, sequence, envelope) slot
+/// identity), this also carries the row `id`, `detected_at` timestamp, and
+/// `resolved` flag that [`SyncEngineDb::list_all_conflicts`] needs to
+/// distinguish and display individual rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConflictRecord {
+    pub id: i64,
+    pub source_account: String,
+    pub sequence: i64,
+    pub envelope_a: [u8; 32],
+    pub envelope_b: [u8; 32],
+    pub detected_at: u64,
+    pub resolved: bool,
+}
+
+/// Row counts and queue age extremes across `SyncEngineDb`'s tables. Built
+/// for `sync-engine-cli db summary` (see `src/cli.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DbSummary {
+    pub queued_envelopes_count: i64,
+    pub settlement_status_count: i64,
+    pub sequence_reservations_count: i64,
+    pub conflicts_count: i64,
+    pub unresolved_conflicts_count: i64,
+    pub oldest_queued_at: Option<u64>,
+    pub newest_queued_at: Option<u64>,
+}
+
 /// A [`DisputeEscalation`] as durably stored, along with the row id used by
 /// [`SyncEngineDb::mark_escalation_submitted`] and the originating
 /// [`Conflict`]'s account/sequence/envelope bookkeeping.
@@ -613,6 +642,105 @@ impl SyncEngineDb {
                 },
             )
             .collect())
+    }
+
+    /// List every recorded conflict, resolved and unresolved alike, oldest
+    /// first. Read-only accessor added for `sync-engine-cli conflicts list`
+    /// (see `src/cli.rs`): [`list_unresolved_conflicts`](Self::list_unresolved_conflicts)
+    /// already existed but only returns unresolved rows and omits `id`,
+    /// `detected_at`, and `resolved`, all of which the CLI needs to display
+    /// and to implement its `--unresolved-only` filter over the full set.
+    pub async fn list_all_conflicts(&self) -> Result<Vec<ConflictRecord>, SyncEngineError> {
+        let rows = self
+            .conn
+            .call(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, source_account, sequence, envelope_a, envelope_b, detected_at, resolved
+                     FROM conflicts ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+                Ok(rows)
+            })
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, source_account, sequence, envelope_a, envelope_b, detected_at, resolved)| {
+                    ConflictRecord {
+                        id,
+                        source_account,
+                        sequence,
+                        envelope_a: envelope_a.try_into().unwrap_or([0u8; 32]),
+                        envelope_b: envelope_b.try_into().unwrap_or([0u8; 32]),
+                        detected_at: detected_at as u64,
+                        resolved: resolved != 0,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// Row counts per table plus the oldest/newest `queued_envelopes.enqueued_at`.
+    /// Read-only accessor added for `sync-engine-cli db summary` (see
+    /// `src/cli.rs`) — nothing already exposed on `SyncEngineDb` returns
+    /// aggregate counts across tables.
+    pub async fn summary(&self) -> Result<DbSummary, SyncEngineError> {
+        let summary = self
+            .conn
+            .call(|conn| {
+                let queued_envelopes_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM queued_envelopes", [], |row| {
+                        row.get(0)
+                    })?;
+                let settlement_status_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM settlement_status", [], |row| {
+                        row.get(0)
+                    })?;
+                let sequence_reservations_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM sequence_reservations", [], |row| {
+                        row.get(0)
+                    })?;
+                let conflicts_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM conflicts", [], |row| row.get(0))?;
+                let unresolved_conflicts_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM conflicts WHERE resolved = 0",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let oldest_queued_at: Option<i64> =
+                    conn.query_row("SELECT MIN(enqueued_at) FROM queued_envelopes", [], |row| {
+                        row.get(0)
+                    })?;
+                let newest_queued_at: Option<i64> =
+                    conn.query_row("SELECT MAX(enqueued_at) FROM queued_envelopes", [], |row| {
+                        row.get(0)
+                    })?;
+
+                Ok(DbSummary {
+                    queued_envelopes_count,
+                    settlement_status_count,
+                    sequence_reservations_count,
+                    conflicts_count,
+                    unresolved_conflicts_count,
+                    oldest_queued_at: oldest_queued_at.map(|v| v as u64),
+                    newest_queued_at: newest_queued_at.map(|v| v as u64),
+                })
+            })
+            .await?;
+        Ok(summary)
     }
 
     /// Durably persist `escalation` (built by
