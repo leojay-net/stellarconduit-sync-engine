@@ -1930,4 +1930,155 @@ mod tests {
             "both concurrent writes must be durably recorded, not corrupted"
         );
     }
+
+    // ── Issue 15: export/import snapshot tests ──
+
+    /// Puts at least one row into every table `export_snapshot` covers, and
+    /// returns the [`Conflict`] used for the conflict/escalation rows so
+    /// callers can cross-check against it if needed.
+    async fn seed_full_db(db: &SyncEngineDb) -> Conflict {
+        db.enqueue_transaction(&mock_envelope(1), "GABC", 101, TxPriority::Emergency, 1000)
+            .await
+            .unwrap();
+        db.set_settlement_status([1u8; 32], SettlementStatus::Propagating, 1001)
+            .await
+            .unwrap();
+
+        db.enqueue_envelope(&mock_envelope(2), "GXYZ", 55, TxPriority::Low, 2000)
+            .await
+            .unwrap();
+
+        let conflict = Conflict {
+            source_account: "GCONFLICT".to_string(),
+            sequence: 202,
+            envelope_a: [3u8; 32],
+            envelope_b: [4u8; 32],
+        };
+        db.record_conflict(&conflict, 3000).await.unwrap();
+
+        let envelope_a = escalation_input(conflict.envelope_a, [10u8; 32], 1000);
+        let envelope_b = escalation_input(conflict.envelope_b, [20u8; 32], 2000);
+        let escalation = build_escalation(&conflict, &envelope_a, &envelope_b).unwrap();
+        db.save_escalation(&conflict, &escalation, 4000)
+            .await
+            .unwrap();
+
+        conflict
+    }
+
+    #[tokio::test]
+    async fn test_export_import_roundtrip_is_lossless() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        seed_full_db(&db).await;
+
+        let summary_before = db.summary().await.unwrap();
+        let mut queued_before = db.list_queued_envelopes().await.unwrap();
+        let conflicts_before = db.list_all_conflicts().await.unwrap();
+        let pending_before = db.list_pending_escalations().await.unwrap();
+        let history_before = db.history_for([1u8; 32]).await.unwrap();
+        let seq_before = db.list_all_sequence_reservations().await.unwrap();
+
+        let snapshot = db.export_snapshot().await.unwrap();
+
+        let fresh = SyncEngineDb::init(":memory:").await.unwrap();
+        let report = fresh.import_snapshot(&snapshot).await.unwrap();
+
+        assert_eq!(report.queued_envelopes_imported, queued_before.len());
+        assert_eq!(report.conflicts_imported, conflicts_before.len());
+        assert_eq!(report.dispute_escalations_imported, pending_before.len());
+        assert_eq!(report.sequence_reservations_imported, seq_before.len());
+
+        // Every table, byte-for-byte, must match what was exported.
+        assert_eq!(fresh.summary().await.unwrap(), summary_before);
+
+        let mut queued_after = fresh.list_queued_envelopes().await.unwrap();
+        queued_after.sort_by_key(|r| r.envelope.message_id);
+        queued_before.sort_by_key(|r| r.envelope.message_id);
+        assert_eq!(queued_after, queued_before);
+
+        assert_eq!(fresh.list_all_conflicts().await.unwrap(), conflicts_before);
+        assert_eq!(
+            fresh.list_pending_escalations().await.unwrap(),
+            pending_before
+        );
+        assert_eq!(fresh.history_for([1u8; 32]).await.unwrap(), history_before);
+        assert_eq!(
+            fresh.list_all_sequence_reservations().await.unwrap(),
+            seq_before
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_into_nonempty_db_follows_documented_policy() {
+        let source = SyncEngineDb::init(":memory:").await.unwrap();
+        seed_full_db(&source).await;
+        let snapshot = source.export_snapshot().await.unwrap();
+
+        let target = SyncEngineDb::init(":memory:").await.unwrap();
+        target
+            .enqueue_envelope(&mock_envelope(99), "GOTHER", 1, TxPriority::Normal, 1)
+            .await
+            .unwrap();
+
+        let result = target.import_snapshot(&snapshot).await;
+        assert!(matches!(result, Err(SyncEngineError::ImportTargetNotEmpty)));
+
+        // The documented policy is reject-not-merge: the target's
+        // pre-existing state must be untouched and none of the snapshot's
+        // rows may have been partially applied.
+        let records = target.list_queued_envelopes().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_account, "GOTHER");
+        assert!(target.list_all_conflicts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_import_rejects_corrupted_snapshot() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+
+        let garbage = vec![0xff, 0x00, 0x13, 0x37];
+        let result = db.import_snapshot(&garbage).await;
+        assert!(matches!(
+            result,
+            Err(SyncEngineError::DeserializationError(_))
+        ));
+
+        let source = SyncEngineDb::init(":memory:").await.unwrap();
+        seed_full_db(&source).await;
+        let snapshot = source.export_snapshot().await.unwrap();
+        let truncated = &snapshot[..snapshot.len() / 2];
+        let result = db.import_snapshot(truncated).await;
+        assert!(matches!(
+            result,
+            Err(SyncEngineError::DeserializationError(_))
+        ));
+
+        // Neither failed attempt may have written anything.
+        assert_eq!(db.summary().await.unwrap(), DbSummary::default());
+    }
+
+    #[tokio::test]
+    async fn test_import_rejects_incompatible_schema_version() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+
+        let bogus = DbSnapshot {
+            schema_version: DB_SNAPSHOT_SCHEMA_VERSION + 1,
+            queued_envelopes: vec![],
+            settlement_status: vec![],
+            sequence_reservations: vec![],
+            conflicts: vec![],
+            settlement_history: vec![],
+            dispute_escalations: vec![],
+        };
+        let bytes = rmp_serde::to_vec(&bogus).unwrap();
+
+        let result = db.import_snapshot(&bytes).await;
+        match result {
+            Err(SyncEngineError::IncompatibleSnapshotSchemaVersion { found, expected }) => {
+                assert_eq!(found, DB_SNAPSHOT_SCHEMA_VERSION + 1);
+                assert_eq!(expected, DB_SNAPSHOT_SCHEMA_VERSION);
+            }
+            other => panic!("expected IncompatibleSnapshotSchemaVersion, got {other:?}"),
+        }
+    }
 }
