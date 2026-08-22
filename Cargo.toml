@@ -129,6 +129,10 @@ path = "tests/integration/queue_storage_roundtrip_test.rs"
 name = "engine_restart_test"
 path = "tests/integration/engine_restart_test.rs"
 
+[[bin]]
+name = "sync-engine-cli"
+path = "src/bin/sync-engine-cli.rs"
+
 # `harness = false` is required for every criterion bench: each file's
 # `criterion_main!` macro defines its own `fn main()`, which conflicts with
 # the default libtest harness cargo would otherwise inject.
