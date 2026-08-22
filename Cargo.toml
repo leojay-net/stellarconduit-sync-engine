@@ -102,6 +102,14 @@ clap = { version = "4.5", features = ["derive"] }
 # JSON rendering for `sync-engine-cli --json`.
 serde_json = "1.0"
 
+# Arbitrary-precision integers for the Wesolowski VDF reference
+# implementation in `src/queue/vdf_ordering.rs` (issue #64): modular
+# squaring over an RSA-style modulus, and the Fiat-Shamir proof built on top
+# of it, both need unbounded-size integers. The "rand" feature enables
+# `RandBigInt` (used only for local modulus/prime generation, never for
+# anything that must be deterministic between prover and verifier).
+num-bigint = { version = "0.4", features = ["rand"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 mockall = "0.12"
