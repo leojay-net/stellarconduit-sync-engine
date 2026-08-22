@@ -103,7 +103,7 @@ pub fn check_invariants(tracker: &SettlementTracker) -> InvariantCheckResult {
 
     let mut seen = std::collections::HashSet::new();
 
-    for (message_id, status) in entries.iter() {
+    for (message_id, status) in &entries {
         if !seen.insert(message_id) {
             return Err(InvariantViolation::DuplicateEntry {
                 message_id: *message_id,
@@ -144,15 +144,8 @@ pub fn check_invariants(tracker: &SettlementTracker) -> InvariantCheckResult {
 
         // Check 4: Disputed only reachable from Propagating
         if *status == SettlementStatus::Disputed {
-            let mut has_valid_predecessor = false;
-            for pred in [SettlementStatus::Propagating] {
-                let pred_legal = get_legal_transitions(pred);
-                if pred_legal.contains(status) {
-                    has_valid_predecessor = true;
-                    break;
-                }
-            }
-            if !has_valid_predecessor {
+            let pred_legal = get_legal_transitions(SettlementStatus::Propagating);
+            if !pred_legal.contains(status) {
                 return Err(InvariantViolation::UnreachableState {
                     message_id: *message_id,
                     status: *status,
