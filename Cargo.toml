@@ -129,6 +129,10 @@ path = "tests/integration/queue_storage_roundtrip_test.rs"
 name = "engine_restart_test"
 path = "tests/integration/engine_restart_test.rs"
 
+[[test]]
+name = "cli_test"
+path = "tests/integration/cli_test.rs"
+
 [[bin]]
 name = "sync-engine-cli"
 path = "src/bin/sync-engine-cli.rs"
