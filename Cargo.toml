@@ -79,6 +79,16 @@ hex = "0.4"
 log = "0.4"
 env_logger = "0.11"
 
+# Seeded and entropy-backed RNG for the Laplace mechanism in
+# `src/metrics.rs` (privacy-preserving metrics export). We sample
+# Laplace(b = Δ/ε) noise in-process rather than taking on a specialised
+# differential-privacy crate: the mechanism is a dozen lines, the
+# calibration is documented against this crate's actual counter
+# sensitivity, and `StdRng` gives reproducible tests via a seed plus
+# production entropy via `from_entropy`. `0.8` is already in this crate's
+# graph (tests, examples, and `ed25519-dalek`).
+rand = "0.8.5"
+
 # Post-Quantum Cryptography
 pqcrypto-dilithium = "0.5"
 pqcrypto-traits = "0.3"
@@ -86,7 +96,6 @@ pqcrypto-traits = "0.3"
 [dev-dependencies]
 tokio-test = "0.4"
 mockall = "0.12"
-rand = "0.8.5"
 tempfile = "3.27"
 
 
