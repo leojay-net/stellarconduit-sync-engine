@@ -679,7 +679,8 @@ mod multisig_tests {
         // A promoted envelope is a genuine TransactionEnvelope and is
         // therefore eligible for OutboundTxQueue — an envelope below
         // threshold has no way to produce one to push here at all.
-        let mut queue = crate::queue::OutboundTxQueue::new();
+        let clock = std::sync::Arc::new(crate::clock::HybridClock::new());
+        let mut queue = crate::queue::OutboundTxQueue::new(clock);
         queue
             .push(
                 hybrid_env.classical_envelope,

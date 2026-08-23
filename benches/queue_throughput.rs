@@ -41,7 +41,9 @@ fn bench_push(c: &mut Criterion) {
     for depth in [1usize, 256, 4096] {
         group.bench_with_input(BenchmarkId::from_parameter(depth), &depth, |b, &n| {
             b.iter(|| {
-                let mut q = OutboundTxQueue::new();
+                let clock =
+                    std::sync::Arc::new(stellarconduit_sync_engine::clock::HybridClock::new());
+                let mut q = OutboundTxQueue::new(clock);
                 for i in 0..n as u32 {
                     let priority = priorities[(i as usize) % priorities.len()];
                     q.push(mock_envelope(i), priority).unwrap();
@@ -63,7 +65,9 @@ fn bench_pop(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(depth), &depth, |b, &n| {
             b.iter_batched(
                 || {
-                    let mut q = OutboundTxQueue::new();
+                    let clock =
+                        std::sync::Arc::new(stellarconduit_sync_engine::clock::HybridClock::new());
+                    let mut q = OutboundTxQueue::new(clock);
                     for i in 0..n as u32 {
                         let priority = priorities[(i as usize) % priorities.len()];
                         q.push(mock_envelope(i), priority).unwrap();

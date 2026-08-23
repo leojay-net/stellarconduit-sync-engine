@@ -56,7 +56,8 @@ async fn main() {
     let db = SyncEngineDb::init(":memory:").await.expect("DB init");
     let mut sequences = SequenceReservationManager::new();
     let mut tracker = SettlementTracker::new();
-    let mut queue = OutboundTxQueue::new();
+    let clock = std::sync::Arc::new(stellarconduit_sync_engine::clock::HybridClock::new());
+    let mut queue = OutboundTxQueue::new(clock);
     let signing_key = SigningKey::generate(&mut OsRng);
     let source_account = "GDEMO";
 

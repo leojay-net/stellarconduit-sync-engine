@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod clock;
 pub mod conflict;
 pub mod engine;
 pub mod envelope;

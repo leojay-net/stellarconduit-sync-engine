@@ -60,18 +60,13 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Duration;
 
 use stellarconduit_core::message::types::TransactionEnvelope;
 
+use crate::clock::Clock;
 use crate::errors::SyncEngineError;
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TxPriority {
@@ -198,23 +193,26 @@ impl EmergencyGuard {
 pub struct OutboundTxQueue {
     heap: BinaryHeap<QueuedTx>,
     emergency_guard: Option<EmergencyGuard>,
+    clock: Arc<dyn Clock>,
 }
 
 impl OutboundTxQueue {
-    pub fn new() -> Self {
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             heap: BinaryHeap::new(),
             emergency_guard: None,
+            clock,
         }
     }
 
     /// Like [`Self::new`], but rejects Emergency-tier pushes that would
     /// exceed `guard_config`'s rolling-window limit. Non-Emergency pushes
     /// are never gated.
-    pub fn with_emergency_guard(guard_config: EmergencyGuardConfig) -> Self {
+    pub fn with_emergency_guard(guard_config: EmergencyGuardConfig, clock: Arc<dyn Clock>) -> Self {
         Self {
             heap: BinaryHeap::new(),
             emergency_guard: Some(EmergencyGuard::new(guard_config)),
+            clock,
         }
     }
 
@@ -229,7 +227,7 @@ impl OutboundTxQueue {
         envelope: TransactionEnvelope,
         priority: TxPriority,
     ) -> Result<(), SyncEngineError> {
-        let enqueued_at = now_secs();
+        let enqueued_at = self.clock.now_secs();
         self.push_at(envelope, priority, enqueued_at)
     }
 
@@ -319,7 +317,8 @@ mod tests {
 
     #[test]
     fn test_higher_priority_pops_first() {
-        let mut q = OutboundTxQueue::new();
+        let clock = Arc::new(crate::clock::MockClock::new(100));
+        let mut q = OutboundTxQueue::new(clock);
         q.push(mock_envelope(1), TxPriority::Low).unwrap();
         q.push(mock_envelope(2), TxPriority::Emergency).unwrap();
         q.push(mock_envelope(3), TxPriority::Normal).unwrap();
@@ -332,7 +331,8 @@ mod tests {
 
     #[test]
     fn test_fifo_within_same_priority() {
-        let mut q = OutboundTxQueue::new();
+        let clock = Arc::new(crate::clock::MockClock::new(100));
+        let mut q = OutboundTxQueue::new(clock);
         q.push_at(mock_envelope(1), TxPriority::Normal, 100)
             .unwrap();
         q.push_at(mock_envelope(2), TxPriority::Normal, 50).unwrap();
@@ -347,7 +347,8 @@ mod tests {
 
     #[test]
     fn test_len_and_is_empty() {
-        let mut q = OutboundTxQueue::new();
+        let clock = Arc::new(crate::clock::MockClock::new(100));
+        let mut q = OutboundTxQueue::new(clock);
         assert!(q.is_empty());
         q.push(mock_envelope(1), TxPriority::Low).unwrap();
         assert_eq!(q.len(), 1);
@@ -369,8 +370,9 @@ mod tests {
 
     #[test]
     fn test_emergency_queuing_within_limit_succeeds() {
+        let clock = Arc::new(crate::clock::MockClock::new(100));
         let config = EmergencyGuardConfig::new(3, Duration::from_secs(3600));
-        let mut q = OutboundTxQueue::with_emergency_guard(config);
+        let mut q = OutboundTxQueue::with_emergency_guard(config, clock);
 
         for i in 0..3 {
             q.push(mock_envelope(i), TxPriority::Emergency).unwrap();
@@ -380,8 +382,9 @@ mod tests {
 
     #[test]
     fn test_emergency_queuing_beyond_limit_is_rejected() {
+        let clock = Arc::new(crate::clock::MockClock::new(100));
         let config = EmergencyGuardConfig::new(2, Duration::from_secs(3600));
-        let mut q = OutboundTxQueue::with_emergency_guard(config);
+        let mut q = OutboundTxQueue::with_emergency_guard(config, clock);
 
         q.push(mock_envelope(1), TxPriority::Emergency).unwrap();
         q.push(mock_envelope(2), TxPriority::Emergency).unwrap();
@@ -408,8 +411,9 @@ mod tests {
 
     #[test]
     fn test_limit_is_configurable() {
+        let clock = Arc::new(crate::clock::MockClock::new(100));
         let permissive = EmergencyGuardConfig::new(5, Duration::from_secs(60));
-        let mut generous_q = OutboundTxQueue::with_emergency_guard(permissive);
+        let mut generous_q = OutboundTxQueue::with_emergency_guard(permissive, clock.clone());
         for i in 0..5 {
             generous_q
                 .push(mock_envelope(i), TxPriority::Emergency)
@@ -420,7 +424,7 @@ mod tests {
             .is_err());
 
         let strict = EmergencyGuardConfig::new(1, Duration::from_secs(60));
-        let mut strict_q = OutboundTxQueue::with_emergency_guard(strict);
+        let mut strict_q = OutboundTxQueue::with_emergency_guard(strict, clock.clone());
         strict_q
             .push(mock_envelope(1), TxPriority::Emergency)
             .unwrap();
@@ -429,7 +433,7 @@ mod tests {
             .is_err());
 
         // A queue with no guard configured never rejects.
-        let mut unguarded_q = OutboundTxQueue::new();
+        let mut unguarded_q = OutboundTxQueue::new(clock);
         for i in 0..10 {
             unguarded_q
                 .push(mock_envelope(i), TxPriority::Emergency)
@@ -439,13 +443,14 @@ mod tests {
 
     #[test]
     fn test_limit_resets_after_window_elapses() {
+        let clock = Arc::new(crate::clock::MockClock::new(1000));
         let config = EmergencyGuardConfig::new(1, Duration::from_secs(60));
-        let mut q = OutboundTxQueue::with_emergency_guard(config);
+        let mut q = OutboundTxQueue::with_emergency_guard(config, clock.clone());
 
         // Seed a single Emergency admission that is already outside the
         // 60s window as of "now", the way a wallet would replay
         // durably-stored history from before a restart.
-        let now = now_secs();
+        let now = clock.now_secs();
         q.restore_at(mock_envelope(1), TxPriority::Emergency, now - 61);
 
         // The window has elapsed for that entry, so a fresh push at the
@@ -463,15 +468,16 @@ mod tests {
         // in-process cache reconstructed from the durable `queued_envelopes`
         // table (see `crate::storage::db::SyncEngineDb`), which already
         // records `priority` and `enqueued_at` for every queued envelope.
-        // This test proves that replaying that durable history through
+        // this test proves that replaying that durable history through
         // `restore_at` after a simulated restart keeps the Emergency guard
         // at its pre-restart count, closing the force-restart bypass.
+        let clock = Arc::new(crate::clock::MockClock::new(1000));
         let config = EmergencyGuardConfig::new(2, Duration::from_secs(3600));
-        let now = now_secs();
+        let now = clock.now_secs();
 
         // "Before restart": a device queues 2 Emergency payments, the max
         // allowed, and each would have been durably persisted immediately.
-        let mut before_restart = OutboundTxQueue::with_emergency_guard(config);
+        let mut before_restart = OutboundTxQueue::with_emergency_guard(config, clock.clone());
         before_restart
             .push_at(mock_envelope(1), TxPriority::Emergency, now)
             .unwrap();
@@ -482,7 +488,7 @@ mod tests {
 
         // "Restart": the in-memory queue is gone. A fresh one is built and
         // seeded from what the wallet reloads out of durable storage.
-        let mut after_restart = OutboundTxQueue::with_emergency_guard(config);
+        let mut after_restart = OutboundTxQueue::with_emergency_guard(config, clock.clone());
         for (i, &ts) in durably_persisted_emergency_timestamps.iter().enumerate() {
             after_restart.restore_at(mock_envelope(i as u8 + 1), TxPriority::Emergency, ts);
         }
