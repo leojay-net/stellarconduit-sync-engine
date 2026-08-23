@@ -189,11 +189,17 @@ impl EmergencyGuard {
 
 /// A local max-heap of outgoing envelopes, ordered by [`TxPriority`] and then
 /// by insertion order (oldest first) within the same tier.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OutboundTxQueue {
     heap: BinaryHeap<QueuedTx>,
     emergency_guard: Option<EmergencyGuard>,
     clock: Arc<dyn Clock>,
+}
+
+impl Default for OutboundTxQueue {
+    fn default() -> Self {
+        Self::new(Arc::new(crate::clock::HybridClock::new()))
+    }
 }
 
 impl OutboundTxQueue {
