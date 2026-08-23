@@ -88,7 +88,8 @@ impl SyncEngine {
         }
 
         // --- Rehydrate the settlement tracker and the dispatchable queue. ---
-        let mut queue = OutboundTxQueue::new();
+        let clock = std::sync::Arc::new(crate::clock::HybridClock::new());
+        let mut queue = OutboundTxQueue::new(clock);
         let mut settlement = SettlementTracker::new();
         for record in db.list_queued_envelopes().await? {
             let status = db
