@@ -120,6 +120,27 @@ pub enum SyncEngineError {
 
     #[error("post-quantum signature verification failed")]
     PqVerificationFailed,
+
+    /// Returned by `SyncEngineDb::import_snapshot` when the target database
+    /// already contains rows in any of its tables. Import is documented and
+    /// implemented as reject-if-nonempty (see that function's doc comment for
+    /// the full rationale) rather than merge or overwrite, so this is not a
+    /// bug to retry past — the caller must import into a fresh database.
+    #[error(
+        "cannot import snapshot: target database is not empty (import_snapshot requires an \
+         empty database — see SyncEngineDb::import_snapshot's documented policy)"
+    )]
+    ImportTargetNotEmpty,
+
+    /// Returned by `SyncEngineDb::import_snapshot` when a snapshot's embedded
+    /// schema version does not match [`crate::storage::db::DB_SNAPSHOT_SCHEMA_VERSION`].
+    /// A structurally-valid snapshot produced by an incompatible version must
+    /// never be silently imported, since its row shapes may not match what
+    /// this build expects.
+    #[error(
+        "snapshot schema version {found} is incompatible with this build's expected version {expected}"
+    )]
+    IncompatibleSnapshotSchemaVersion { found: u32, expected: u32 },
 }
 
 impl SyncEngineError {
@@ -151,6 +172,8 @@ impl SyncEngineError {
     /// | `SqliteError` | Transient | Raw `rusqlite` errors (e.g. `SQLITE_BUSY`, `SQLITE_LOCKED`) are similarly caused by disk/locking contention and are generally safe to retry. Callers that need to distinguish truly fatal SQLite errors (e.g. corruption) may inspect the inner `rusqlite::Error` further, but the default classification is Transient. |
     /// | `SerializationError` | Permanent | A value could not be encoded to MessagePack. This reflects a type-system mismatch or an unencodable value; retrying the same data will produce the same error. |
     /// | `DeserializationError` | Permanent | Stored bytes could not be decoded. The bytes are corrupted or were written by an incompatible schema version. Retrying the same read will not repair the data. |
+    /// | `ImportTargetNotEmpty` | Permanent | `import_snapshot`'s documented policy refuses a non-empty target. Retrying the identical call against the same database will always hit the same refusal; the caller must choose a fresh database. |
+    /// | `IncompatibleSnapshotSchemaVersion` | Permanent | The snapshot was produced by a different schema version than this build expects. Retrying the same import will reproduce the same mismatch; a migration path is needed instead. |
     #[deny(unreachable_patterns)]
     pub fn classify(&self) -> ErrorClass {
         match self {
@@ -168,6 +191,8 @@ impl SyncEngineError {
             SyncEngineError::SerializationError(_) => ErrorClass::Permanent,
             SyncEngineError::DeserializationError(_) => ErrorClass::Permanent,
             SyncEngineError::PqVerificationFailed => ErrorClass::Permanent,
+            SyncEngineError::ImportTargetNotEmpty => ErrorClass::Permanent,
+            SyncEngineError::IncompatibleSnapshotSchemaVersion { .. } => ErrorClass::Permanent,
 
             // ── RequiresEscalation: needs human/on-chain intervention ──
             SyncEngineError::UnresolvedConflict(_) => ErrorClass::RequiresEscalation,
@@ -231,6 +256,11 @@ mod tests {
             SyncEngineError::SerializationError(rmp_serde::encode::Error::UnknownLength),
             SyncEngineError::DeserializationError(rmp_serde::decode::Error::Syntax("test".into())),
             SyncEngineError::PqVerificationFailed,
+            SyncEngineError::ImportTargetNotEmpty,
+            SyncEngineError::IncompatibleSnapshotSchemaVersion {
+                found: 1,
+                expected: 2,
+            },
         ]
     }
 
