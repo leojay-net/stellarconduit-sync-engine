@@ -2,6 +2,7 @@ pub mod cli;
 pub mod clock;
 pub mod conflict;
 pub mod engine;
+pub mod encryption;
 pub mod envelope;
 pub mod errors;
 pub mod ffi;
