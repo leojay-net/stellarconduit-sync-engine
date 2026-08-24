@@ -5,14 +5,27 @@
 
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use tokio_rusqlite::Connection;
 
+use stellarconduit_core::message::relay_proof::RelayChainProof;
 use stellarconduit_core::message::types::TransactionEnvelope;
 
-use crate::conflict::Conflict;
+use crate::conflict::{Conflict, DisputeEscalation};
 use crate::errors::SyncEngineError;
 use crate::queue::TxPriority;
 use crate::settlement::SettlementStatus;
+
+/// Version tag embedded in every [`SyncEngineDb::export_snapshot`] output and
+/// checked by [`SyncEngineDb::import_snapshot`].
+///
+/// Issue #11 ("Implement Schema Versioning and Migrations for SyncEngineDb")
+/// had not landed when this was written, so this is a minimal, standalone
+/// version tag scoped to the snapshot format rather than a general schema
+/// migration scheme. If/when #11 lands, this constant should be replaced
+/// with (or defined in terms of) its schema version rather than kept as a
+/// second, competing version number.
+pub const DB_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
 pub struct SyncEngineDb {
     conn: Connection,
@@ -33,6 +46,159 @@ pub struct HistoryEntry {
     pub from_status: String,
     pub to_status: String,
     pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchUpdateReport {
+    pub applied: Vec<[u8; 32]>,
+    pub rejected: Vec<([u8; 32], String)>,
+}
+
+/// A single recorded double-spend conflict, as durably stored — unlike
+/// [`Conflict`] (which only carries the (account, sequence, envelope) slot
+/// identity), this also carries the row `id`, `detected_at` timestamp, and
+/// `resolved` flag that [`SyncEngineDb::list_all_conflicts`] needs to
+/// distinguish and display individual rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConflictRecord {
+    pub id: i64,
+    pub source_account: String,
+    pub sequence: i64,
+    pub envelope_a: [u8; 32],
+    pub envelope_b: [u8; 32],
+    pub detected_at: u64,
+    pub resolved: bool,
+}
+
+/// Row counts and queue age extremes across `SyncEngineDb`'s tables. Built
+/// for `sync-engine-cli db summary` (see `src/cli.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DbSummary {
+    pub queued_envelopes_count: i64,
+    pub settlement_status_count: i64,
+    pub sequence_reservations_count: i64,
+    pub conflicts_count: i64,
+    pub unresolved_conflicts_count: i64,
+    pub oldest_queued_at: Option<u64>,
+    pub newest_queued_at: Option<u64>,
+}
+
+/// A [`DisputeEscalation`] as durably stored, along with the row id used by
+/// [`SyncEngineDb::mark_escalation_submitted`] and the originating
+/// [`Conflict`]'s account/sequence/envelope bookkeeping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedEscalation {
+    pub id: i64,
+    pub source_account: String,
+    pub sequence: i64,
+    pub envelope_a: [u8; 32],
+    pub envelope_b: [u8; 32],
+    pub escalation: DisputeEscalation,
+    pub created_at: u64,
+}
+
+/// Outcome of [`SyncEngineDb::import_snapshot`]: how many rows were restored
+/// into each table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ImportReport {
+    pub queued_envelopes_imported: usize,
+    pub settlement_status_imported: usize,
+    pub sequence_reservations_imported: usize,
+    pub conflicts_imported: usize,
+    pub settlement_history_imported: usize,
+    pub dispute_escalations_imported: usize,
+}
+
+// ── Snapshot row types ──────────────────────────────────────────────────
+//
+// These mirror each table's columns directly (rather than the domain types
+// like `Conflict`/`DisputeEscalation` used elsewhere in this file) so that
+// `export_snapshot`/`import_snapshot` round-trip the exact bytes SQLite
+// holds — including opaque columns like `envelope_bytes` and `proof_bytes`
+// — without a re-encode step that could silently normalize or lose data.
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct QueuedEnvelopeRow {
+    message_id: Vec<u8>,
+    source_account: String,
+    sequence: i64,
+    priority: i64,
+    enqueued_at: i64,
+    envelope_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SettlementStatusRow {
+    message_id: Vec<u8>,
+    status: String,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SequenceReservationRow {
+    source_account: String,
+    last_reserved: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ConflictRow {
+    id: i64,
+    source_account: String,
+    sequence: i64,
+    envelope_a: Vec<u8>,
+    envelope_b: Vec<u8>,
+    detected_at: i64,
+    resolved: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SettlementHistoryRow {
+    id: i64,
+    message_id: Vec<u8>,
+    from_status: String,
+    to_status: String,
+    timestamp: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct DisputeEscalationRow {
+    id: i64,
+    source_account: String,
+    sequence: i64,
+    envelope_a: Vec<u8>,
+    envelope_b: Vec<u8>,
+    initiator: String,
+    respondent: String,
+    tx_id: Vec<u8>,
+    proof_bytes: Vec<u8>,
+    created_at: i64,
+    submitted: i64,
+}
+
+/// The full portable contents of a [`SyncEngineDb`], as produced by
+/// [`SyncEngineDb::export_snapshot`] and consumed by
+/// [`SyncEngineDb::import_snapshot`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct DbSnapshot {
+    schema_version: u32,
+    queued_envelopes: Vec<QueuedEnvelopeRow>,
+    settlement_status: Vec<SettlementStatusRow>,
+    sequence_reservations: Vec<SequenceReservationRow>,
+    conflicts: Vec<ConflictRow>,
+    settlement_history: Vec<SettlementHistoryRow>,
+    dispute_escalations: Vec<DisputeEscalationRow>,
+}
+
+/// Result of attempting the transactional half of an import: whether the
+/// database turned out to be non-empty is decided *inside* the same
+/// transaction that would otherwise perform the insert, so there is no
+/// window between a separate "is it empty?" check and the insert itself in
+/// which a concurrent writer could sneak in a row (this matters because
+/// `SyncEngineDb` is designed to be shared behind an `Arc` across
+/// concurrent callers — see `test_escalation_survives_conflicting_concurrent_writes`).
+enum ImportOutcome {
+    Imported(ImportReport),
+    TargetNotEmpty,
 }
 
 impl SyncEngineDb {
@@ -83,6 +249,20 @@ impl SyncEngineDb {
                     from_status TEXT NOT NULL,
                     to_status   TEXT NOT NULL,
                     timestamp   INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS dispute_escalations (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_account  TEXT NOT NULL,
+                    sequence        INTEGER NOT NULL,
+                    envelope_a      BLOB NOT NULL,
+                    envelope_b      BLOB NOT NULL,
+                    initiator       TEXT NOT NULL,
+                    respondent      TEXT NOT NULL,
+                    tx_id           BLOB NOT NULL,
+                    proof_bytes     BLOB NOT NULL,
+                    created_at      INTEGER NOT NULL,
+                    submitted       INTEGER NOT NULL DEFAULT 0
                 );",
             )?;
             Ok(())
@@ -120,6 +300,65 @@ impl SyncEngineDb {
                         envelope_bytes
                     ],
                 )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Atomically persist a newly-signed payment in a single SQLite
+    /// transaction: its sequence reservation, the queued envelope, and its
+    /// initial `Queued` settlement status.
+    ///
+    /// All three rows share one transaction so that a crash at any instant
+    /// leaves the database either fully updated (the call completed) or
+    /// entirely unchanged (as if the call never happened) — never a
+    /// half-written state. This is what lets [`crate::engine::SyncEngine`] be
+    /// restart-safe: a Stellar sequence number cannot be skipped on-chain, so
+    /// writing the reservation without the envelope (or the envelope without
+    /// the reservation) would either burn a gap or invite a reuse, both of
+    /// which are double-spend hazards against the user's own account.
+    pub async fn enqueue_transaction(
+        &self,
+        envelope: &TransactionEnvelope,
+        source_account: &str,
+        sequence: i64,
+        priority: TxPriority,
+        enqueued_at: u64,
+    ) -> Result<(), SyncEngineError> {
+        let message_id = envelope.message_id.to_vec();
+        let envelope_bytes = rmp_serde::to_vec(envelope)?;
+        let source_account = source_account.to_string();
+        let priority: i64 = priority.into();
+        let status = SettlementStatus::Queued.as_str().to_string();
+
+        self.conn
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO sequence_reservations
+                        (source_account, last_reserved) VALUES (?1, ?2)",
+                    rusqlite::params![source_account, sequence],
+                )?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO queued_envelopes
+                        (message_id, source_account, sequence, priority, enqueued_at, envelope_bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        message_id,
+                        source_account,
+                        sequence,
+                        priority,
+                        enqueued_at as i64,
+                        envelope_bytes
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO settlement_status (message_id, status, updated_at)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![message_id, status, enqueued_at as i64],
+                )?;
+                tx.commit()?;
                 Ok(())
             })
             .await?;
@@ -269,6 +508,80 @@ impl SyncEngineDb {
         Ok(())
     }
 
+    /// Update settlement statuses in bulk inside a single database transaction.
+    /// Uses a Best-Effort policy: valid transitions are committed while illegal
+    /// transitions (or untracked envelopes) are skipped and reported as `rejected`
+    /// in the returned `BatchUpdateReport`.
+    /// This prevents a single stale message in a large relayed batch from
+    /// rejecting the entire batch and causing massive network re-transmission.
+    pub async fn set_settlement_status_batch(
+        &self,
+        updates: &[([u8; 32], SettlementStatus, u64)],
+    ) -> Result<BatchUpdateReport, SyncEngineError> {
+        let updates = updates.to_vec();
+
+        let report = self
+            .conn
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                let mut applied = Vec::new();
+                let mut rejected = Vec::new();
+
+                for (message_id, to_status, updated_at) in updates {
+                    let id = message_id.to_vec();
+
+                    let from_status_res: rusqlite::Result<String> = tx
+                        .query_row(
+                            "SELECT status FROM settlement_status WHERE message_id = ?1",
+                            rusqlite::params![id],
+                            |row| row.get(0),
+                        );
+
+                    let from_status_str = match from_status_res {
+                        Ok(s) => s,
+                        Err(rusqlite::Error::QueryReturnedNoRows) => {
+                            rejected.push((message_id, "Untracked envelope".to_string()));
+                            continue;
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+
+                    let is_valid = match from_status_str.parse::<SettlementStatus>() {
+                        Ok(current_status) => current_status.can_transition_to(to_status),
+                        Err(_) => false,
+                    };
+
+                    if !is_valid {
+                        rejected.push((
+                            message_id,
+                            format!("Illegal transition from '{}' to '{}'", from_status_str, to_status.as_str()),
+                        ));
+                        continue;
+                    }
+
+                    let to_status_str = to_status.as_str().to_string();
+                    tx.execute(
+                        "UPDATE settlement_status SET status = ?1, updated_at = ?2 WHERE message_id = ?3",
+                        rusqlite::params![to_status_str, updated_at as i64, id],
+                    )?;
+
+                    tx.execute(
+                        "INSERT INTO settlement_history (message_id, from_status, to_status, timestamp)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![id, from_status_str, to_status_str, updated_at as i64],
+                    )?;
+
+                    applied.push(message_id);
+                }
+
+                tx.commit()?;
+                Ok(BatchUpdateReport { applied, rejected })
+            })
+            .await?;
+
+        Ok(report)
+    }
+
     pub async fn get_settlement_status(
         &self,
         message_id: [u8; 32],
@@ -366,6 +679,31 @@ impl SyncEngineDb {
         Ok(value)
     }
 
+    /// Load every known account's last-reserved sequence number. Used by
+    /// [`crate::engine::SyncEngine::open`] to rehydrate all in-memory sequence
+    /// state in one pass after a restart; the per-account
+    /// [`Self::load_sequence_reservation`] is for single-account lookups.
+    pub async fn list_all_sequence_reservations(
+        &self,
+    ) -> Result<std::collections::HashMap<String, i64>, SyncEngineError> {
+        let rows = self
+            .conn
+            .call(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT source_account, last_reserved FROM sequence_reservations")?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let source_account: String = row.get(0)?;
+                        let last_reserved: i64 = row.get(1)?;
+                        Ok((source_account, last_reserved))
+                    })?
+                    .collect::<Result<std::collections::HashMap<_, _>, rusqlite::Error>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows)
+    }
+
     pub async fn record_conflict(
         &self,
         conflict: &Conflict,
@@ -422,6 +760,244 @@ impl SyncEngineDb {
             .collect())
     }
 
+    /// List every recorded conflict, resolved and unresolved alike, oldest
+    /// first. Read-only accessor added for `sync-engine-cli conflicts list`
+    /// (see `src/cli.rs`): [`list_unresolved_conflicts`](Self::list_unresolved_conflicts)
+    /// already existed but only returns unresolved rows and omits `id`,
+    /// `detected_at`, and `resolved`, all of which the CLI needs to display
+    /// and to implement its `--unresolved-only` filter over the full set.
+    pub async fn list_all_conflicts(&self) -> Result<Vec<ConflictRecord>, SyncEngineError> {
+        let rows = self
+            .conn
+            .call(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, source_account, sequence, envelope_a, envelope_b, detected_at, resolved
+                     FROM conflicts ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+                Ok(rows)
+            })
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, source_account, sequence, envelope_a, envelope_b, detected_at, resolved)| {
+                    ConflictRecord {
+                        id,
+                        source_account,
+                        sequence,
+                        envelope_a: envelope_a.try_into().unwrap_or([0u8; 32]),
+                        envelope_b: envelope_b.try_into().unwrap_or([0u8; 32]),
+                        detected_at: detected_at as u64,
+                        resolved: resolved != 0,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// Row counts per table plus the oldest/newest `queued_envelopes.enqueued_at`.
+    /// Read-only accessor added for `sync-engine-cli db summary` (see
+    /// `src/cli.rs`) — nothing already exposed on `SyncEngineDb` returns
+    /// aggregate counts across tables.
+    pub async fn summary(&self) -> Result<DbSummary, SyncEngineError> {
+        let summary = self
+            .conn
+            .call(|conn| {
+                let queued_envelopes_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM queued_envelopes", [], |row| {
+                        row.get(0)
+                    })?;
+                let settlement_status_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM settlement_status", [], |row| {
+                        row.get(0)
+                    })?;
+                let sequence_reservations_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM sequence_reservations", [], |row| {
+                        row.get(0)
+                    })?;
+                let conflicts_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM conflicts", [], |row| row.get(0))?;
+                let unresolved_conflicts_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM conflicts WHERE resolved = 0",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let oldest_queued_at: Option<i64> =
+                    conn.query_row("SELECT MIN(enqueued_at) FROM queued_envelopes", [], |row| {
+                        row.get(0)
+                    })?;
+                let newest_queued_at: Option<i64> =
+                    conn.query_row("SELECT MAX(enqueued_at) FROM queued_envelopes", [], |row| {
+                        row.get(0)
+                    })?;
+
+                Ok(DbSummary {
+                    queued_envelopes_count,
+                    settlement_status_count,
+                    sequence_reservations_count,
+                    conflicts_count,
+                    unresolved_conflicts_count,
+                    oldest_queued_at: oldest_queued_at.map(|v| v as u64),
+                    newest_queued_at: newest_queued_at.map(|v| v as u64),
+                })
+            })
+            .await?;
+        Ok(summary)
+    }
+
+    /// Durably persist `escalation` (built by
+    /// `crate::conflict::escalation::build_escalation` for `conflict`) and
+    /// set [`SettlementStatus::Disputed`] on both of `conflict`'s envelopes —
+    /// per the architecture, an escalated conflict's envelopes are neither
+    /// settled nor failed until on-chain arbitration resolves them.
+    ///
+    /// Returns the new row's id, which `mark_escalation_submitted` uses to
+    /// identify it later.
+    pub async fn save_escalation(
+        &self,
+        conflict: &Conflict,
+        escalation: &DisputeEscalation,
+        created_at: u64,
+    ) -> Result<i64, SyncEngineError> {
+        let source_account = conflict.source_account.clone();
+        let sequence = conflict.sequence;
+        let envelope_a = conflict.envelope_a.to_vec();
+        let envelope_b = conflict.envelope_b.to_vec();
+        let initiator = escalation.initiator.clone();
+        let respondent = escalation.respondent.clone();
+        let tx_id = escalation.tx_id.to_vec();
+        let proof_bytes = rmp_serde::to_vec(&escalation.proof)?;
+
+        let id = self
+            .conn
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO dispute_escalations
+                        (source_account, sequence, envelope_a, envelope_b, initiator, respondent, tx_id, proof_bytes, created_at, submitted)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
+                    rusqlite::params![
+                        source_account,
+                        sequence,
+                        envelope_a,
+                        envelope_b,
+                        initiator,
+                        respondent,
+                        tx_id,
+                        proof_bytes,
+                        created_at as i64
+                    ],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await?;
+
+        self.set_settlement_status(conflict.envelope_a, SettlementStatus::Disputed, created_at)
+            .await?;
+        self.set_settlement_status(conflict.envelope_b, SettlementStatus::Disputed, created_at)
+            .await?;
+
+        Ok(id)
+    }
+
+    /// List every escalation not yet marked submitted (`submitted = 0`) —
+    /// i.e. still awaiting pickup by a relay node with live Soroban RPC
+    /// connectivity.
+    pub async fn list_pending_escalations(
+        &self,
+    ) -> Result<Vec<PersistedEscalation>, SyncEngineError> {
+        let rows = self
+            .conn
+            .call(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, source_account, sequence, envelope_a, envelope_b, initiator,
+                            respondent, tx_id, proof_bytes, created_at
+                     FROM dispute_escalations WHERE submitted = 0",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, Vec<u8>>(7)?,
+                            row.get::<_, Vec<u8>>(8)?,
+                            row.get::<_, i64>(9)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+                Ok(rows)
+            })
+            .await?;
+
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    source_account,
+                    sequence,
+                    envelope_a,
+                    envelope_b,
+                    initiator,
+                    respondent,
+                    tx_id,
+                    proof_bytes,
+                    created_at,
+                )| {
+                    let proof: RelayChainProof = rmp_serde::from_slice(&proof_bytes)?;
+                    Ok(PersistedEscalation {
+                        id,
+                        source_account,
+                        sequence,
+                        envelope_a: envelope_a.try_into().unwrap_or([0u8; 32]),
+                        envelope_b: envelope_b.try_into().unwrap_or([0u8; 32]),
+                        escalation: DisputeEscalation {
+                            initiator,
+                            respondent,
+                            tx_id: tx_id.try_into().unwrap_or([0u8; 32]),
+                            proof,
+                        },
+                        created_at: created_at as u64,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Mark the escalation with row id `id` as submitted, excluding it from
+    /// future [`list_pending_escalations`](Self::list_pending_escalations)
+    /// results. Called by a relay node once it has successfully submitted
+    /// the payload to `raise_dispute` on-chain.
+    pub async fn mark_escalation_submitted(&self, id: i64) -> Result<(), SyncEngineError> {
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE dispute_escalations SET submitted = 1 WHERE id = ?1",
+                    rusqlite::params![id],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn sweep_stale_envelopes(
         &self,
         max_age_secs: u64,
@@ -459,6 +1035,349 @@ impl SyncEngineDb {
         }
 
         Ok(stale_ids)
+    }
+
+    /// Serialize every table in this database into a single portable,
+    /// versioned blob suitable for moving a device's entire sync-engine
+    /// state (pending payments, sequence reservations, unresolved
+    /// conflicts, dispute escalations, settlement history) to another
+    /// device — see issue #15.
+    ///
+    /// # Format and versioning
+    ///
+    /// The blob is a MessagePack-encoded [`DbSnapshot`], tagged with
+    /// [`DB_SNAPSHOT_SCHEMA_VERSION`]. Issue #11 (schema versioning for
+    /// `SyncEngineDb`) had not landed at the time this was written; if it
+    /// lands later, this constant should be unified with its scheme rather
+    /// than kept as a second version number.
+    ///
+    /// # Encryption at rest
+    ///
+    /// This function does **not** encrypt its output. It reads whatever
+    /// plaintext rows the current connection can see and serializes them
+    /// as-is. Issue #12 (encryption at rest for `SyncEngineDb`) had not
+    /// landed at the time this was written; if/when it lands, note that an
+    /// exported snapshot is **not** an encrypted artifact merely because
+    /// the source database is encrypted at rest — encryption at rest
+    /// protects the on-disk SQLite file, not the output of this function.
+    /// A snapshot is exactly as sensitive as the payment history it
+    /// contains (source accounts, sequence numbers, full transaction
+    /// envelopes, dispute proofs) and must be treated as plaintext
+    /// financial data by callers: transmit it only over an encrypted
+    /// channel (e.g. a direct authenticated device-to-device transfer) and
+    /// do not persist it unencrypted at rest. Wrapping the returned bytes
+    /// in caller-side encryption (ideally using the same key material as
+    /// #12's at-rest encryption, so a snapshot is never a plaintext copy of
+    /// something the source database was encrypting) is recommended but
+    /// intentionally left to the caller, since #15 is independent of #12
+    /// and the two may land in either order.
+    ///
+    /// # Sequence reservations
+    ///
+    /// `sequence_reservations` rows are exported and imported as-is. A
+    /// sequence baseline reserved on the source device may be stale by the
+    /// time it reaches the target device (e.g. the account transacted from
+    /// elsewhere in the interim) — see issue #8. **Callers must run stale
+    /// sequence reconciliation immediately after [`Self::import_snapshot`]
+    /// returns and before queuing anything new**; this function does not
+    /// (and cannot, without live network access to the account) validate
+    /// the reservation against current on-chain state itself.
+    pub async fn export_snapshot(&self) -> Result<Vec<u8>, SyncEngineError> {
+        let snapshot = self
+            .conn
+            .call(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT message_id, source_account, sequence, priority, enqueued_at, envelope_bytes
+                     FROM queued_envelopes",
+                )?;
+                let queued_envelopes = stmt
+                    .query_map([], |row| {
+                        Ok(QueuedEnvelopeRow {
+                            message_id: row.get(0)?,
+                            source_account: row.get(1)?,
+                            sequence: row.get(2)?,
+                            priority: row.get(3)?,
+                            enqueued_at: row.get(4)?,
+                            envelope_bytes: row.get(5)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+                let mut stmt = conn
+                    .prepare("SELECT message_id, status, updated_at FROM settlement_status")?;
+                let settlement_status = stmt
+                    .query_map([], |row| {
+                        Ok(SettlementStatusRow {
+                            message_id: row.get(0)?,
+                            status: row.get(1)?,
+                            updated_at: row.get(2)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+                let mut stmt = conn
+                    .prepare("SELECT source_account, last_reserved FROM sequence_reservations")?;
+                let sequence_reservations = stmt
+                    .query_map([], |row| {
+                        Ok(SequenceReservationRow {
+                            source_account: row.get(0)?,
+                            last_reserved: row.get(1)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+                let mut stmt = conn.prepare(
+                    "SELECT id, source_account, sequence, envelope_a, envelope_b, detected_at, resolved
+                     FROM conflicts",
+                )?;
+                let conflicts = stmt
+                    .query_map([], |row| {
+                        Ok(ConflictRow {
+                            id: row.get(0)?,
+                            source_account: row.get(1)?,
+                            sequence: row.get(2)?,
+                            envelope_a: row.get(3)?,
+                            envelope_b: row.get(4)?,
+                            detected_at: row.get(5)?,
+                            resolved: row.get(6)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+                let mut stmt = conn.prepare(
+                    "SELECT id, message_id, from_status, to_status, timestamp
+                     FROM settlement_history",
+                )?;
+                let settlement_history = stmt
+                    .query_map([], |row| {
+                        Ok(SettlementHistoryRow {
+                            id: row.get(0)?,
+                            message_id: row.get(1)?,
+                            from_status: row.get(2)?,
+                            to_status: row.get(3)?,
+                            timestamp: row.get(4)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+                let mut stmt = conn.prepare(
+                    "SELECT id, source_account, sequence, envelope_a, envelope_b, initiator,
+                            respondent, tx_id, proof_bytes, created_at, submitted
+                     FROM dispute_escalations",
+                )?;
+                let dispute_escalations = stmt
+                    .query_map([], |row| {
+                        Ok(DisputeEscalationRow {
+                            id: row.get(0)?,
+                            source_account: row.get(1)?,
+                            sequence: row.get(2)?,
+                            envelope_a: row.get(3)?,
+                            envelope_b: row.get(4)?,
+                            initiator: row.get(5)?,
+                            respondent: row.get(6)?,
+                            tx_id: row.get(7)?,
+                            proof_bytes: row.get(8)?,
+                            created_at: row.get(9)?,
+                            submitted: row.get(10)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+                Ok(DbSnapshot {
+                    schema_version: DB_SNAPSHOT_SCHEMA_VERSION,
+                    queued_envelopes,
+                    settlement_status,
+                    sequence_reservations,
+                    conflicts,
+                    settlement_history,
+                    dispute_escalations,
+                })
+            })
+            .await?;
+
+        Ok(rmp_serde::to_vec(&snapshot)?)
+    }
+
+    /// Restore a snapshot produced by [`Self::export_snapshot`] into this
+    /// database — see issue #15.
+    ///
+    /// # Import policy: reject into a non-empty database
+    ///
+    /// This function **rejects the import with
+    /// [`SyncEngineError::ImportTargetNotEmpty`] if any table in this
+    /// database already contains a row.** It does not merge or overwrite.
+    ///
+    /// This was chosen over merge/overwrite because every table here
+    /// guards financial or double-spend-sensitive state: silently merging
+    /// two `sequence_reservations` for the same account, or two
+    /// `queued_envelopes`/`conflicts` rows, requires a conflict-resolution
+    /// policy no less complex than the one `crate::conflict` already exists
+    /// to implement for on-chain envelopes — inventing a second, weaker one
+    /// just for import would risk exactly the double-spend and
+    /// lost-payment hazards this crate is otherwise built to prevent.
+    /// Reject-if-nonempty keeps the operation's outcome trivially provable
+    /// (empty + snapshot = snapshot, exactly) and matches the intended
+    /// use case described in issue #15: restoring onto a new device, whose
+    /// database is normally fresh. A caller that genuinely needs to
+    /// combine two non-empty databases should do so explicitly at a higher
+    /// level, not implicitly inside this function.
+    ///
+    /// The emptiness check and the insert happen inside the same SQLite
+    /// transaction, so a concurrent write landing between "check" and
+    /// "insert" cannot cause a corrupt or partial import.
+    ///
+    /// # Corrupted or truncated input
+    ///
+    /// A `data` that is not a valid, complete [`DbSnapshot`] encoding fails
+    /// with [`SyncEngineError::DeserializationError`] before anything is
+    /// written — there is no partial-write state to worry about.
+    ///
+    /// # Schema version
+    ///
+    /// A snapshot whose embedded version does not match
+    /// [`DB_SNAPSHOT_SCHEMA_VERSION`] is rejected with
+    /// [`SyncEngineError::IncompatibleSnapshotSchemaVersion`] rather than
+    /// imported speculatively.
+    ///
+    /// # Sequence reservations and encryption at rest
+    ///
+    /// See [`Self::export_snapshot`]'s documentation for the recommended
+    /// post-import reconciliation flow (issue #8) and this format's
+    /// relationship to encryption at rest (issue #12).
+    pub async fn import_snapshot(&self, data: &[u8]) -> Result<ImportReport, SyncEngineError> {
+        let snapshot: DbSnapshot = rmp_serde::from_slice(data)?;
+
+        if snapshot.schema_version != DB_SNAPSHOT_SCHEMA_VERSION {
+            return Err(SyncEngineError::IncompatibleSnapshotSchemaVersion {
+                found: snapshot.schema_version,
+                expected: DB_SNAPSHOT_SCHEMA_VERSION,
+            });
+        }
+
+        let outcome = self
+            .conn
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+
+                let existing_rows: i64 = tx.query_row(
+                    "SELECT
+                        (SELECT COUNT(*) FROM queued_envelopes) +
+                        (SELECT COUNT(*) FROM settlement_status) +
+                        (SELECT COUNT(*) FROM sequence_reservations) +
+                        (SELECT COUNT(*) FROM conflicts) +
+                        (SELECT COUNT(*) FROM settlement_history) +
+                        (SELECT COUNT(*) FROM dispute_escalations)",
+                    [],
+                    |row| row.get(0),
+                )?;
+
+                if existing_rows != 0 {
+                    return Ok(ImportOutcome::TargetNotEmpty);
+                }
+
+                for row in &snapshot.queued_envelopes {
+                    tx.execute(
+                        "INSERT INTO queued_envelopes
+                            (message_id, source_account, sequence, priority, enqueued_at, envelope_bytes)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            row.message_id,
+                            row.source_account,
+                            row.sequence,
+                            row.priority,
+                            row.enqueued_at,
+                            row.envelope_bytes
+                        ],
+                    )?;
+                }
+
+                for row in &snapshot.settlement_status {
+                    tx.execute(
+                        "INSERT INTO settlement_status (message_id, status, updated_at)
+                         VALUES (?1, ?2, ?3)",
+                        rusqlite::params![row.message_id, row.status, row.updated_at],
+                    )?;
+                }
+
+                for row in &snapshot.sequence_reservations {
+                    tx.execute(
+                        "INSERT INTO sequence_reservations (source_account, last_reserved)
+                         VALUES (?1, ?2)",
+                        rusqlite::params![row.source_account, row.last_reserved],
+                    )?;
+                }
+
+                for row in &snapshot.conflicts {
+                    tx.execute(
+                        "INSERT INTO conflicts
+                            (id, source_account, sequence, envelope_a, envelope_b, detected_at, resolved)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        rusqlite::params![
+                            row.id,
+                            row.source_account,
+                            row.sequence,
+                            row.envelope_a,
+                            row.envelope_b,
+                            row.detected_at,
+                            row.resolved
+                        ],
+                    )?;
+                }
+
+                for row in &snapshot.settlement_history {
+                    tx.execute(
+                        "INSERT INTO settlement_history
+                            (id, message_id, from_status, to_status, timestamp)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![
+                            row.id,
+                            row.message_id,
+                            row.from_status,
+                            row.to_status,
+                            row.timestamp
+                        ],
+                    )?;
+                }
+
+                for row in &snapshot.dispute_escalations {
+                    tx.execute(
+                        "INSERT INTO dispute_escalations
+                            (id, source_account, sequence, envelope_a, envelope_b, initiator,
+                             respondent, tx_id, proof_bytes, created_at, submitted)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        rusqlite::params![
+                            row.id,
+                            row.source_account,
+                            row.sequence,
+                            row.envelope_a,
+                            row.envelope_b,
+                            row.initiator,
+                            row.respondent,
+                            row.tx_id,
+                            row.proof_bytes,
+                            row.created_at,
+                            row.submitted
+                        ],
+                    )?;
+                }
+
+                tx.commit()?;
+
+                Ok(ImportOutcome::Imported(ImportReport {
+                    queued_envelopes_imported: snapshot.queued_envelopes.len(),
+                    settlement_status_imported: snapshot.settlement_status.len(),
+                    sequence_reservations_imported: snapshot.sequence_reservations.len(),
+                    conflicts_imported: snapshot.conflicts.len(),
+                    settlement_history_imported: snapshot.settlement_history.len(),
+                    dispute_escalations_imported: snapshot.dispute_escalations.len(),
+                }))
+            })
+            .await?;
+
+        match outcome {
+            ImportOutcome::Imported(report) => Ok(report),
+            ImportOutcome::TargetNotEmpty => Err(SyncEngineError::ImportTargetNotEmpty),
+        }
     }
 }
 
@@ -541,6 +1460,141 @@ mod tests {
         assert_eq!(
             db.load_sequence_reservation("GABC").await.unwrap(),
             Some(101)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_applies_all_valid_transitions() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        // Insert initial queued status
+        db.set_settlement_status([1u8; 32], SettlementStatus::Queued, 1000)
+            .await
+            .unwrap();
+        db.set_settlement_status([2u8; 32], SettlementStatus::Queued, 1000)
+            .await
+            .unwrap();
+
+        let report = db
+            .set_settlement_status_batch(&[
+                ([1u8; 32], SettlementStatus::Propagating, 1001),
+                ([2u8; 32], SettlementStatus::Failed, 1001),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(report.applied.len(), 2);
+        assert_eq!(report.rejected.len(), 0);
+
+        assert_eq!(
+            db.get_settlement_status([1u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Propagating)
+        );
+        assert_eq!(
+            db.get_settlement_status([2u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_handles_mixed_valid_and_invalid_per_documented_policy() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        db.set_settlement_status([1u8; 32], SettlementStatus::Settled, 1000)
+            .await
+            .unwrap();
+        db.set_settlement_status([2u8; 32], SettlementStatus::Queued, 1000)
+            .await
+            .unwrap();
+
+        let report = db
+            .set_settlement_status_batch(&[
+                // Invalid: Settled -> Propagating
+                ([1u8; 32], SettlementStatus::Propagating, 1001),
+                // Valid: Queued -> Propagating
+                ([2u8; 32], SettlementStatus::Propagating, 1001),
+                // Invalid: Untracked envelope
+                ([3u8; 32], SettlementStatus::Propagating, 1001),
+            ])
+            .await
+            .unwrap();
+
+        // Best effort: only valid ones are applied
+        assert_eq!(report.applied, vec![[2u8; 32]]);
+        assert_eq!(report.rejected.len(), 2);
+
+        // Status unchanged for invalid transition
+        assert_eq!(
+            db.get_settlement_status([1u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Settled)
+        );
+        // Status changed for valid transition
+        assert_eq!(
+            db.get_settlement_status([2u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Propagating)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_report_accurately_reflects_outcomes() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        db.set_settlement_status([1u8; 32], SettlementStatus::Queued, 1000)
+            .await
+            .unwrap();
+
+        let report = db
+            .set_settlement_status_batch(&[
+                ([1u8; 32], SettlementStatus::Propagating, 1001),
+                ([9u8; 32], SettlementStatus::Propagating, 1001),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(report.applied, vec![[1u8; 32]]);
+        assert_eq!(report.rejected[0].0, [9u8; 32]);
+        assert_eq!(report.rejected[0].1, "Untracked envelope");
+    }
+
+    #[tokio::test]
+    async fn test_batch_is_faster_than_sequential() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let count = 500;
+
+        for i in 0..count {
+            let mut id = [0u8; 32];
+            id[0..4].copy_from_slice(&(i as u32).to_be_bytes());
+            db.set_settlement_status(id, SettlementStatus::Queued, 1000)
+                .await
+                .unwrap();
+        }
+
+        let mut sequential_updates = Vec::new();
+        let mut batch_updates = Vec::new();
+        for i in 0..count {
+            let mut id = [0u8; 32];
+            id[0..4].copy_from_slice(&(i as u32).to_be_bytes());
+            if i % 2 == 0 {
+                sequential_updates.push((id, SettlementStatus::Propagating, 1001));
+            } else {
+                batch_updates.push((id, SettlementStatus::Propagating, 1001));
+            }
+        }
+
+        let start_seq = std::time::Instant::now();
+        for (id, status, time) in sequential_updates {
+            db.set_settlement_status(id, status, time).await.unwrap();
+        }
+        let seq_duration = start_seq.elapsed();
+
+        let start_batch = std::time::Instant::now();
+        db.set_settlement_status_batch(&batch_updates)
+            .await
+            .unwrap();
+        let batch_duration = start_batch.elapsed();
+
+        assert!(
+            batch_duration < seq_duration,
+            "Batch: {:?}, Seq: {:?}",
+            batch_duration,
+            seq_duration
         );
     }
 
@@ -707,5 +1761,324 @@ mod tests {
 
         let second = db.sweep_stale_envelopes(500, 1000).await.unwrap();
         assert!(second.is_empty());
+    }
+
+    // ── Issue 2: dispute escalation tests ──
+
+    use crate::conflict::escalation::{build_escalation, EscalationInput};
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+    use tempfile::TempDir;
+
+    fn temp_db_path() -> (TempDir, String) {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("escalation-test.sqlite3");
+        (dir, path.to_string_lossy().into_owned())
+    }
+
+    fn escalation_input(
+        message_id: [u8; 32],
+        origin_pubkey: [u8; 32],
+        seen_at: u64,
+    ) -> EscalationInput {
+        let key = SigningKey::generate(&mut OsRng);
+        EscalationInput {
+            message_id,
+            origin_pubkey,
+            first_seen_locally_at: seen_at,
+            proof: RelayChainProof::sign(&key, &message_id, &[9u8; 32], 101),
+        }
+    }
+
+    fn sample_conflict() -> Conflict {
+        Conflict {
+            source_account: "GABC".to_string(),
+            sequence: 101,
+            envelope_a: [1u8; 32],
+            envelope_b: [2u8; 32],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_escalation_persists_across_restart() {
+        let (_dir, path) = temp_db_path();
+        let conflict = sample_conflict();
+        let escalation = {
+            let db = SyncEngineDb::init(&path).await.unwrap();
+            let envelope_a = escalation_input(conflict.envelope_a, [10u8; 32], 1000);
+            let envelope_b = escalation_input(conflict.envelope_b, [20u8; 32], 2000);
+            let escalation = build_escalation(&conflict, &envelope_a, &envelope_b).unwrap();
+            db.save_escalation(&conflict, &escalation, 3000)
+                .await
+                .unwrap();
+            escalation
+            // `db` dropped here, closing the connection -- simulates a restart.
+        };
+
+        let reopened = SyncEngineDb::init(&path).await.unwrap();
+        let pending = reopened.list_pending_escalations().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].source_account, conflict.source_account);
+        assert_eq!(pending[0].sequence, conflict.sequence);
+        assert_eq!(pending[0].envelope_a, conflict.envelope_a);
+        assert_eq!(pending[0].envelope_b, conflict.envelope_b);
+        assert_eq!(pending[0].escalation, escalation);
+
+        // Escalating both envelopes must have set them Disputed too.
+        assert_eq!(
+            reopened
+                .get_settlement_status(conflict.envelope_a)
+                .await
+                .unwrap(),
+            Some(SettlementStatus::Disputed)
+        );
+        assert_eq!(
+            reopened
+                .get_settlement_status(conflict.envelope_b)
+                .await
+                .unwrap(),
+            Some(SettlementStatus::Disputed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_submitted_excludes_from_pending_list() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let conflict = sample_conflict();
+        let envelope_a = escalation_input(conflict.envelope_a, [10u8; 32], 1000);
+        let envelope_b = escalation_input(conflict.envelope_b, [20u8; 32], 2000);
+        let escalation = build_escalation(&conflict, &envelope_a, &envelope_b).unwrap();
+
+        let id = db
+            .save_escalation(&conflict, &escalation, 3000)
+            .await
+            .unwrap();
+
+        assert_eq!(db.list_pending_escalations().await.unwrap().len(), 1);
+
+        db.mark_escalation_submitted(id).await.unwrap();
+
+        assert!(db.list_pending_escalations().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_pending_escalations_excludes_only_submitted() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+
+        let conflict_1 = sample_conflict();
+        let envelope_a_1 = escalation_input(conflict_1.envelope_a, [10u8; 32], 1000);
+        let envelope_b_1 = escalation_input(conflict_1.envelope_b, [20u8; 32], 2000);
+        let escalation_1 = build_escalation(&conflict_1, &envelope_a_1, &envelope_b_1).unwrap();
+        let id_1 = db
+            .save_escalation(&conflict_1, &escalation_1, 3000)
+            .await
+            .unwrap();
+
+        let conflict_2 = Conflict {
+            source_account: "GXYZ".to_string(),
+            sequence: 202,
+            envelope_a: [3u8; 32],
+            envelope_b: [4u8; 32],
+        };
+        let envelope_a_2 = escalation_input(conflict_2.envelope_a, [30u8; 32], 1500);
+        let envelope_b_2 = escalation_input(conflict_2.envelope_b, [40u8; 32], 2500);
+        let escalation_2 = build_escalation(&conflict_2, &envelope_a_2, &envelope_b_2).unwrap();
+        db.save_escalation(&conflict_2, &escalation_2, 3500)
+            .await
+            .unwrap();
+
+        db.mark_escalation_submitted(id_1).await.unwrap();
+
+        let pending = db.list_pending_escalations().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].source_account, "GXYZ");
+    }
+
+    #[tokio::test]
+    async fn test_escalation_survives_conflicting_concurrent_writes() {
+        // Two conflicting escalations for the same tx_id, written concurrently,
+        // must both land intact -- tokio_rusqlite serializes calls through a
+        // single connection actor, so this must never corrupt storage.
+        let db = std::sync::Arc::new(SyncEngineDb::init(":memory:").await.unwrap());
+
+        let conflict = sample_conflict();
+        let envelope_a = escalation_input(conflict.envelope_a, [10u8; 32], 1000);
+        let envelope_b = escalation_input(conflict.envelope_b, [20u8; 32], 2000);
+        let escalation_1 = build_escalation(&conflict, &envelope_a, &envelope_b).unwrap();
+        let escalation_2 = escalation_1.clone();
+
+        let conflict_1 = conflict.clone();
+        let conflict_2 = conflict.clone();
+        let db_1 = db.clone();
+        let db_2 = db.clone();
+
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(
+                async move { db_1.save_escalation(&conflict_1, &escalation_1, 3000).await }
+            ),
+            tokio::spawn(
+                async move { db_2.save_escalation(&conflict_2, &escalation_2, 3001).await }
+            ),
+        );
+        r1.unwrap().unwrap();
+        r2.unwrap().unwrap();
+
+        let pending = db.list_pending_escalations().await.unwrap();
+        assert_eq!(
+            pending.len(),
+            2,
+            "both concurrent writes must be durably recorded, not corrupted"
+        );
+    }
+
+    // ── Issue 15: export/import snapshot tests ──
+
+    /// Puts at least one row into every table `export_snapshot` covers, and
+    /// returns the [`Conflict`] used for the conflict/escalation rows so
+    /// callers can cross-check against it if needed.
+    async fn seed_full_db(db: &SyncEngineDb) -> Conflict {
+        db.enqueue_transaction(&mock_envelope(1), "GABC", 101, TxPriority::Emergency, 1000)
+            .await
+            .unwrap();
+        db.set_settlement_status([1u8; 32], SettlementStatus::Propagating, 1001)
+            .await
+            .unwrap();
+
+        db.enqueue_envelope(&mock_envelope(2), "GXYZ", 55, TxPriority::Low, 2000)
+            .await
+            .unwrap();
+
+        let conflict = Conflict {
+            source_account: "GCONFLICT".to_string(),
+            sequence: 202,
+            envelope_a: [3u8; 32],
+            envelope_b: [4u8; 32],
+        };
+        db.record_conflict(&conflict, 3000).await.unwrap();
+
+        let envelope_a = escalation_input(conflict.envelope_a, [10u8; 32], 1000);
+        let envelope_b = escalation_input(conflict.envelope_b, [20u8; 32], 2000);
+        let escalation = build_escalation(&conflict, &envelope_a, &envelope_b).unwrap();
+        db.save_escalation(&conflict, &escalation, 4000)
+            .await
+            .unwrap();
+
+        conflict
+    }
+
+    #[tokio::test]
+    async fn test_export_import_roundtrip_is_lossless() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        seed_full_db(&db).await;
+
+        let summary_before = db.summary().await.unwrap();
+        let mut queued_before = db.list_queued_envelopes().await.unwrap();
+        let conflicts_before = db.list_all_conflicts().await.unwrap();
+        let pending_before = db.list_pending_escalations().await.unwrap();
+        let history_before = db.history_for([1u8; 32]).await.unwrap();
+        let seq_before = db.list_all_sequence_reservations().await.unwrap();
+
+        let snapshot = db.export_snapshot().await.unwrap();
+
+        let fresh = SyncEngineDb::init(":memory:").await.unwrap();
+        let report = fresh.import_snapshot(&snapshot).await.unwrap();
+
+        assert_eq!(report.queued_envelopes_imported, queued_before.len());
+        assert_eq!(report.conflicts_imported, conflicts_before.len());
+        assert_eq!(report.dispute_escalations_imported, pending_before.len());
+        assert_eq!(report.sequence_reservations_imported, seq_before.len());
+
+        // Every table, byte-for-byte, must match what was exported.
+        assert_eq!(fresh.summary().await.unwrap(), summary_before);
+
+        let mut queued_after = fresh.list_queued_envelopes().await.unwrap();
+        queued_after.sort_by_key(|r| r.envelope.message_id);
+        queued_before.sort_by_key(|r| r.envelope.message_id);
+        assert_eq!(queued_after, queued_before);
+
+        assert_eq!(fresh.list_all_conflicts().await.unwrap(), conflicts_before);
+        assert_eq!(
+            fresh.list_pending_escalations().await.unwrap(),
+            pending_before
+        );
+        assert_eq!(fresh.history_for([1u8; 32]).await.unwrap(), history_before);
+        assert_eq!(
+            fresh.list_all_sequence_reservations().await.unwrap(),
+            seq_before
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_into_nonempty_db_follows_documented_policy() {
+        let source = SyncEngineDb::init(":memory:").await.unwrap();
+        seed_full_db(&source).await;
+        let snapshot = source.export_snapshot().await.unwrap();
+
+        let target = SyncEngineDb::init(":memory:").await.unwrap();
+        target
+            .enqueue_envelope(&mock_envelope(99), "GOTHER", 1, TxPriority::Normal, 1)
+            .await
+            .unwrap();
+
+        let result = target.import_snapshot(&snapshot).await;
+        assert!(matches!(result, Err(SyncEngineError::ImportTargetNotEmpty)));
+
+        // The documented policy is reject-not-merge: the target's
+        // pre-existing state must be untouched and none of the snapshot's
+        // rows may have been partially applied.
+        let records = target.list_queued_envelopes().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_account, "GOTHER");
+        assert!(target.list_all_conflicts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_import_rejects_corrupted_snapshot() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+
+        let garbage = vec![0xff, 0x00, 0x13, 0x37];
+        let result = db.import_snapshot(&garbage).await;
+        assert!(matches!(
+            result,
+            Err(SyncEngineError::DeserializationError(_))
+        ));
+
+        let source = SyncEngineDb::init(":memory:").await.unwrap();
+        seed_full_db(&source).await;
+        let snapshot = source.export_snapshot().await.unwrap();
+        let truncated = &snapshot[..snapshot.len() / 2];
+        let result = db.import_snapshot(truncated).await;
+        assert!(matches!(
+            result,
+            Err(SyncEngineError::DeserializationError(_))
+        ));
+
+        // Neither failed attempt may have written anything.
+        assert_eq!(db.summary().await.unwrap(), DbSummary::default());
+    }
+
+    #[tokio::test]
+    async fn test_import_rejects_incompatible_schema_version() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+
+        let bogus = DbSnapshot {
+            schema_version: DB_SNAPSHOT_SCHEMA_VERSION + 1,
+            queued_envelopes: vec![],
+            settlement_status: vec![],
+            sequence_reservations: vec![],
+            conflicts: vec![],
+            settlement_history: vec![],
+            dispute_escalations: vec![],
+        };
+        let bytes = rmp_serde::to_vec(&bogus).unwrap();
+
+        let result = db.import_snapshot(&bytes).await;
+        match result {
+            Err(SyncEngineError::IncompatibleSnapshotSchemaVersion { found, expected }) => {
+                assert_eq!(found, DB_SNAPSHOT_SCHEMA_VERSION + 1);
+                assert_eq!(expected, DB_SNAPSHOT_SCHEMA_VERSION);
+            }
+            other => panic!("expected IncompatibleSnapshotSchemaVersion, got {other:?}"),
+        }
     }
 }

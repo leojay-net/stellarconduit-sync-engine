@@ -44,6 +44,19 @@ pub enum SyncEngineError {
     #[error("envelope validation failed: {0}")]
     InvalidEnvelope(String),
 
+    #[error("failed to parse transaction XDR: {0}")]
+    XdrParse(String),
+
+    #[error("caller-claimed source account {claimed} does not match the source account {actual} encoded in the transaction XDR")]
+    SourceAccountMismatch { claimed: String, actual: String },
+
+    #[error("reserved sequence {reserved} does not match the sequence {actual} encoded in the transaction XDR for account {account}")]
+    SequenceMismatch {
+        account: String,
+        reserved: i64,
+        actual: i64,
+    },
+
     #[error("no queued envelope found for message_id {0}")]
     EnvelopeNotFound(String),
 
@@ -104,6 +117,30 @@ pub enum SyncEngineError {
 
     #[error("deserialization error: {0}")]
     DeserializationError(#[from] rmp_serde::decode::Error),
+
+    #[error("post-quantum signature verification failed")]
+    PqVerificationFailed,
+
+    /// Returned by `SyncEngineDb::import_snapshot` when the target database
+    /// already contains rows in any of its tables. Import is documented and
+    /// implemented as reject-if-nonempty (see that function's doc comment for
+    /// the full rationale) rather than merge or overwrite, so this is not a
+    /// bug to retry past — the caller must import into a fresh database.
+    #[error(
+        "cannot import snapshot: target database is not empty (import_snapshot requires an \
+         empty database — see SyncEngineDb::import_snapshot's documented policy)"
+    )]
+    ImportTargetNotEmpty,
+
+    /// Returned by `SyncEngineDb::import_snapshot` when a snapshot's embedded
+    /// schema version does not match [`crate::storage::db::DB_SNAPSHOT_SCHEMA_VERSION`].
+    /// A structurally-valid snapshot produced by an incompatible version must
+    /// never be silently imported, since its row shapes may not match what
+    /// this build expects.
+    #[error(
+        "snapshot schema version {found} is incompatible with this build's expected version {expected}"
+    )]
+    IncompatibleSnapshotSchemaVersion { found: u32, expected: u32 },
 }
 
 impl SyncEngineError {
@@ -122,6 +159,9 @@ impl SyncEngineError {
     /// | `NoSequenceReserved` | Permanent | The caller never called `seed()`/`reserve()` before attempting to build an envelope. This is a programming error; retrying the same call without fixing the caller will always fail. |
     /// | `SequenceOutOfOrder` | Permanent | The caller passed a sequence number that regresses or equals `last_reserved`. This is a logical invariant violation in caller code; the sequence must be corrected before any retry makes sense. |
     /// | `InvalidEnvelope` | Permanent | Envelope validation failed because the payload itself is malformed. The same invalid bytes will fail validation on every attempt. |
+    /// | `XdrParse` | Permanent | The transaction XDR itself could not be parsed. The same bytes will fail to parse on every attempt; the caller must supply a well-formed transaction. |
+    /// | `SourceAccountMismatch` | Permanent | The caller-claimed source account doesn't match the one encoded in the transaction XDR. This is a caller bug (wrong account supplied); retrying with the same mismatched inputs will always fail. |
+    /// | `SequenceMismatch` | Permanent | The reserved sequence number doesn't match the one encoded in the transaction XDR. Retrying without correcting the sequence or the XDR will reproduce the same mismatch. |
     /// | `EnvelopeNotFound` | Permanent | A lookup by `message_id` returned nothing. The envelope was never enqueued, or has already been removed. Retrying the same lookup against the same DB will not materialise it. |
     /// | `InvalidStateTransition` | Permanent | A state-machine transition was attempted that is not in the legal transition graph. Retrying the same transition will never become legal; the caller has a logic bug. |
     /// | `UnresolvedConflict` | RequiresEscalation | Two envelopes compete for the same account/sequence slot and could not be resolved off-chain. Neither retrying nor giving up is correct — the dispute must be escalated to the on-chain `dispute-resolver` contract (see issue #002). |
@@ -132,6 +172,8 @@ impl SyncEngineError {
     /// | `SqliteError` | Transient | Raw `rusqlite` errors (e.g. `SQLITE_BUSY`, `SQLITE_LOCKED`) are similarly caused by disk/locking contention and are generally safe to retry. Callers that need to distinguish truly fatal SQLite errors (e.g. corruption) may inspect the inner `rusqlite::Error` further, but the default classification is Transient. |
     /// | `SerializationError` | Permanent | A value could not be encoded to MessagePack. This reflects a type-system mismatch or an unencodable value; retrying the same data will produce the same error. |
     /// | `DeserializationError` | Permanent | Stored bytes could not be decoded. The bytes are corrupted or were written by an incompatible schema version. Retrying the same read will not repair the data. |
+    /// | `ImportTargetNotEmpty` | Permanent | `import_snapshot`'s documented policy refuses a non-empty target. Retrying the identical call against the same database will always hit the same refusal; the caller must choose a fresh database. |
+    /// | `IncompatibleSnapshotSchemaVersion` | Permanent | The snapshot was produced by a different schema version than this build expects. Retrying the same import will reproduce the same mismatch; a migration path is needed instead. |
     #[deny(unreachable_patterns)]
     pub fn classify(&self) -> ErrorClass {
         match self {
@@ -139,12 +181,18 @@ impl SyncEngineError {
             SyncEngineError::NoSequenceReserved(_) => ErrorClass::Permanent,
             SyncEngineError::SequenceOutOfOrder { .. } => ErrorClass::Permanent,
             SyncEngineError::InvalidEnvelope(_) => ErrorClass::Permanent,
+            SyncEngineError::XdrParse(_) => ErrorClass::Permanent,
+            SyncEngineError::SourceAccountMismatch { .. } => ErrorClass::Permanent,
+            SyncEngineError::SequenceMismatch { .. } => ErrorClass::Permanent,
             SyncEngineError::EnvelopeNotFound(_) => ErrorClass::Permanent,
             SyncEngineError::InvalidStateTransition { .. } => ErrorClass::Permanent,
             SyncEngineError::UnknownMultisigSigner { .. } => ErrorClass::Permanent,
             SyncEngineError::MultisigThresholdNotMet { .. } => ErrorClass::Permanent,
             SyncEngineError::SerializationError(_) => ErrorClass::Permanent,
             SyncEngineError::DeserializationError(_) => ErrorClass::Permanent,
+            SyncEngineError::PqVerificationFailed => ErrorClass::Permanent,
+            SyncEngineError::ImportTargetNotEmpty => ErrorClass::Permanent,
+            SyncEngineError::IncompatibleSnapshotSchemaVersion { .. } => ErrorClass::Permanent,
 
             // ── RequiresEscalation: needs human/on-chain intervention ──
             SyncEngineError::UnresolvedConflict(_) => ErrorClass::RequiresEscalation,
@@ -172,6 +220,16 @@ mod tests {
                 last_reserved: 10,
             },
             SyncEngineError::InvalidEnvelope("bad payload".into()),
+            SyncEngineError::XdrParse("bad xdr".into()),
+            SyncEngineError::SourceAccountMismatch {
+                claimed: "GCLAIMED".into(),
+                actual: "GACTUAL".into(),
+            },
+            SyncEngineError::SequenceMismatch {
+                account: "GTEST".into(),
+                reserved: 5,
+                actual: 6,
+            },
             SyncEngineError::EnvelopeNotFound("deadbeef".into()),
             SyncEngineError::InvalidStateTransition {
                 from: "queued".into(),
@@ -197,6 +255,12 @@ mod tests {
             SyncEngineError::SqliteError(rusqlite::Error::InvalidQuery),
             SyncEngineError::SerializationError(rmp_serde::encode::Error::UnknownLength),
             SyncEngineError::DeserializationError(rmp_serde::decode::Error::Syntax("test".into())),
+            SyncEngineError::PqVerificationFailed,
+            SyncEngineError::ImportTargetNotEmpty,
+            SyncEngineError::IncompatibleSnapshotSchemaVersion {
+                found: 1,
+                expected: 2,
+            },
         ]
     }
 
@@ -285,6 +349,31 @@ mod tests {
     }
 
     #[test]
+    fn test_xdr_derivation_errors_are_permanent() {
+        assert_eq!(
+            SyncEngineError::XdrParse("bad xdr".into()).classify(),
+            ErrorClass::Permanent
+        );
+        assert_eq!(
+            SyncEngineError::SourceAccountMismatch {
+                claimed: "GCLAIMED".into(),
+                actual: "GACTUAL".into(),
+            }
+            .classify(),
+            ErrorClass::Permanent
+        );
+        assert_eq!(
+            SyncEngineError::SequenceMismatch {
+                account: "GTEST".into(),
+                reserved: 5,
+                actual: 6,
+            }
+            .classify(),
+            ErrorClass::Permanent
+        );
+    }
+
+    #[test]
     fn test_envelope_not_found_is_permanent() {
         assert_eq!(
             SyncEngineError::EnvelopeNotFound("deadbeef".into()).classify(),
@@ -332,5 +421,10 @@ mod tests {
         let dec_err =
             SyncEngineError::DeserializationError(rmp_serde::decode::Error::Syntax("test".into()));
         assert_eq!(dec_err.classify(), ErrorClass::Permanent);
+
+        assert_eq!(
+            SyncEngineError::PqVerificationFailed.classify(),
+            ErrorClass::Permanent
+        );
     }
 }

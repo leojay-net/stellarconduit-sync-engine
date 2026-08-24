@@ -87,6 +87,15 @@ impl SettlementTracker {
         self.statuses.insert(message_id, SettlementStatus::Queued);
     }
 
+    /// Restore an envelope directly to `status`, bypassing transition
+    /// validation. Used when rehydrating the tracker from durable storage on
+    /// restart — the persisted status is ground truth and must be taken as-is
+    /// rather than re-derived through a (possibly impossible) chain of legal
+    /// transitions.
+    pub fn restore(&mut self, message_id: [u8; 32], status: SettlementStatus) {
+        self.statuses.insert(message_id, status);
+    }
+
     pub fn status(&self, message_id: &[u8; 32]) -> Option<SettlementStatus> {
         self.statuses.get(message_id).copied()
     }
@@ -113,6 +122,15 @@ impl SettlementTracker {
 
         self.statuses.insert(message_id, next);
         Ok(())
+    }
+
+    /// Get all tracked entries as a vector of (message_id, status) pairs.
+    /// Used by the invariant checker to iterate over all tracked states.
+    pub fn get_all_entries(&self) -> Vec<([u8; 32], SettlementStatus)> {
+        self.statuses
+            .iter()
+            .map(|(id, status)| (*id, *status))
+            .collect()
     }
 }
 

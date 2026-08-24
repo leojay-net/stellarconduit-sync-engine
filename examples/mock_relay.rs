@@ -6,6 +6,7 @@ use rand::rngs::OsRng;
 
 use stellarconduit_core::message::envelope::validate_envelope;
 use stellarconduit_sync_engine::conflict::{conflicts_between, QueuedSlot};
+use stellarconduit_sync_engine::envelope::pq::SigningPolicy;
 use stellarconduit_sync_engine::envelope::OfflineEnvelopeBuilder;
 use stellarconduit_sync_engine::queue::{OutboundTxQueue, SequenceReservationManager, TxPriority};
 use stellarconduit_sync_engine::settlement::{SettlementStatus, SettlementTracker};
@@ -55,7 +56,8 @@ async fn main() {
     let db = SyncEngineDb::init(":memory:").await.expect("DB init");
     let mut sequences = SequenceReservationManager::new();
     let mut tracker = SettlementTracker::new();
-    let mut queue = OutboundTxQueue::new();
+    let clock = std::sync::Arc::new(stellarconduit_sync_engine::clock::HybridClock::new());
+    let mut queue = OutboundTxQueue::new(clock);
     let signing_key = SigningKey::generate(&mut OsRng);
     let source_account = "GDEMO";
 
@@ -69,14 +71,16 @@ async fn main() {
             _ => TxPriority::Low,
         };
 
-        let (envelope, seq) = OfflineEnvelopeBuilder::build_and_sign(
+        let (hybrid, seq) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
             source_account,
             &signing_key,
+            &SigningPolicy::ClassicalOnly,
             format!("mock_tx_xdr_{}", i),
             10,
         )
         .expect("build_and_sign");
+        let envelope = hybrid.classical_envelope;
 
         assert!(validate_envelope(&envelope).is_ok());
 
@@ -158,22 +162,27 @@ async fn main() {
         seq_a.seed(shared, 500);
         seq_b.seed(shared, 500);
 
-        let (env_a, s_a) = OfflineEnvelopeBuilder::build_and_sign(
+        let (hybrid_a, s_a) = OfflineEnvelopeBuilder::build_and_sign(
             &mut seq_a,
             shared,
             &key_a,
+            &SigningPolicy::ClassicalOnly,
             "conflict_xdr_a",
             10,
         )
         .expect("build A");
-        let (env_b, s_b) = OfflineEnvelopeBuilder::build_and_sign(
+        let env_a = hybrid_a.classical_envelope;
+
+        let (hybrid_b, s_b) = OfflineEnvelopeBuilder::build_and_sign(
             &mut seq_b,
             shared,
             &key_b,
+            &SigningPolicy::ClassicalOnly,
             "conflict_xdr_b",
             10,
         )
         .expect("build B");
+        let env_b = hybrid_b.classical_envelope;
 
         assert_eq!(s_a, s_b);
 

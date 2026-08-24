@@ -6,11 +6,36 @@ description = "Offline transaction queue, conflict resolution, and settlement tr
 license = "Apache-2.0"
 
 [lib]
-crate-type = ["rlib"]
+# `cdylib` and `staticlib` are needed alongside `rlib` so `src/ffi.rs`'s
+# `#[no_mangle] extern "C"` functions are actually exported as linkable
+# symbols for mobile consumers: `cdylib` produces the shared object Android/
+# JNI links against, `staticlib` produces the archive iOS links against, and
+# `rlib` keeps this crate usable as an ordinary Rust dependency (e.g. from
+# this crate's own `tests/`). Mirrors `stellarconduit-core`'s `[lib]` section,
+# which needs `cdylib` for the same reason (its own `src/ffi.rs`).
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 # Shared mesh envelope types, signing, and relay-chain proofs
 stellarconduit-core = { git = "https://github.com/StellarConduit/stellarconduit-core.git", rev = "da4c057" }
+
+# Stellar transaction XDR parsing.
+#
+# We derive the true source account and sequence number from the already-built
+# transaction XDR rather than trusting caller-supplied values (see
+# `src/envelope/xdr.rs`). `stellar-xdr` at `22.1` is already in this crate's
+# dependency graph transitively, via `stellarconduit-core -> soroban-sdk`, so
+# depending on it directly adds no new crate versions to the build — important
+# for size-sensitive mobile wallets. Reaching through `soroban-sdk`'s `xdr`
+# re-export instead would have pulled the whole Soroban host API into our direct
+# surface for no benefit; `stellar-xdr` alone gives us exactly the transaction
+# envelope types we need. `default-features = false` with an explicit feature
+# set keeps the footprint to just the `curr` XDR types plus base64 decoding.
+stellar-xdr = { version = "22.1", default-features = false, features = [
+    "std",
+    "curr",
+    "base64",
+] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -29,6 +54,17 @@ rmp-serde = "1.1"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 sha2 = "0.10.8"
 
+# Stellar StrKey (SEP-0023) encoding/decoding — official Stellar Development
+# Foundation tooling. Used to turn the raw ed25519 `origin_pubkey` carried on
+# every `TransactionEnvelope` into the `G...`-prefixed account address the
+# `dispute-resolver` Soroban contract's `Address` parameters expect (see
+# `src/stellar_address.rs`). This is the well-specified encoding step only —
+# not a place to hand-roll CRC16/base32 logic. `default-features = false`
+# keeps it to its minimal `heapless` + `data-encoding` footprint; the
+# `cli`/`serde` features would pull in `clap`, `serde_json`, and `thiserror`
+# that this crate has no use for.
+stellar-strkey = { version = "0.0.16", default-features = false }
+
 # Async runtime
 tokio = { version = "1.37", features = ["full"] }
 
@@ -43,13 +79,41 @@ hex = "0.4"
 log = "0.4"
 env_logger = "0.11"
 
+# Seeded and entropy-backed RNG for the Laplace mechanism in
+# `src/metrics.rs` (privacy-preserving metrics export). We sample
+# Laplace(b = Δ/ε) noise in-process rather than taking on a specialised
+# differential-privacy crate: the mechanism is a dozen lines, the
+# calibration is documented against this crate's actual counter
+# sensitivity, and `StdRng` gives reproducible tests via a seed plus
+# production entropy via `from_entropy`. `0.8` is already in this crate's
+# graph (tests, examples, and `ed25519-dalek`).
+rand = "0.8.5"
+
+# Post-Quantum Cryptography
+pqcrypto-dilithium = "0.5"
+pqcrypto-traits = "0.3"
+
+# CLI argument parsing for `src/bin/sync-engine-cli.rs`. Must live in
+# `[dependencies]`, not `[dev-dependencies]`: dev-dependencies are only linked
+# for `cargo test`/`--examples`/`--benches`, not for a crate's own `[[bin]]`
+# targets under a normal `cargo build`.
+clap = { version = "4.5", features = ["derive"] }
+
+# JSON rendering for `sync-engine-cli --json`.
+serde_json = "1.0"
+
+# Arbitrary-precision integers for the Wesolowski VDF reference
+# implementation in `src/queue/vdf_ordering.rs` (issue #64): modular
+# squaring over an RSA-style modulus, and the Fiat-Shamir proof built on top
+# of it, both need unbounded-size integers. The "rand" feature enables
+# `RandBigInt` (used only for local modulus/prime generation, never for
+# anything that must be deterministic between prover and verifier).
+num-bigint = { version = "0.4", features = ["rand"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 mockall = "0.12"
-rand = "0.8.5"
-criterion = { version = "0.5", features = ["async_tokio"] }
-tokio = { version = "1.37", features = ["full"] }
-clap = { version = "4.5", features = ["derive"] }
+tempfile = "3.27"
 
 # Property-based testing for conflict detection and the settlement state
 # machine. Chosen over quickcheck: proptest ships built-in shrinking (failures
@@ -58,9 +122,36 @@ clap = { version = "4.5", features = ["derive"] }
 # the QueuedSlot generators these tests need.
 proptest = "1.5"
 
+# Benchmark harness for benches/*.rs (throughput of conflict detection, queue
+# push/pop, and storage operations). Declared here because the benches
+# themselves were added in a prior PR without this dependency, which left
+# `cargo clippy --all-targets` / `cargo test --workspace` unable to compile.
+criterion = "0.5"
+
+
 [[test]]
 name = "queue_storage_roundtrip_test"
 path = "tests/integration/queue_storage_roundtrip_test.rs"
+
+[[test]]
+name = "engine_restart_test"
+path = "tests/integration/engine_restart_test.rs"
+
+[[test]]
+name = "cli_test"
+path = "tests/integration/cli_test.rs"
+
+[[bin]]
+name = "sync-engine-cli"
+path = "src/bin/sync-engine-cli.rs"
+
+# `harness = false` is required for every criterion bench: each file's
+# `criterion_main!` macro defines its own `fn main()`, which conflicts with
+# the default libtest harness cargo would otherwise inject.
+[[bench]]
+name = "conflict_detection"
+path = "benches/conflict_detection.rs"
+harness = false
 
 [[bench]]
 name = "queue_throughput"
@@ -70,9 +161,4 @@ harness = false
 [[bench]]
 name = "storage_throughput"
 path = "benches/storage_throughput.rs"
-harness = false
-
-[[bench]]
-name = "conflict_detection"
-path = "benches/conflict_detection.rs"
 harness = false

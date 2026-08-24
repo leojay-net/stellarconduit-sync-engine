@@ -1,29 +1,62 @@
-# Add property-based and fuzz testing for conflict detection and settlement
+# Database Export/Import for Device Migration
 
-Closes #25.
+Addresses #15.
 
-## Summary
+## Problem
 
-Every test in this crate was example-based — specific inputs, specific expected outputs. That's not enough for the two most safety-critical pieces of code here: `conflict::detector`/`conflict::resolver` (double-spend detection) and `settlement::tracker`'s state machine (an invalid transition could report a payment settled when it isn't, or vice versa). This PR adds property-based and fuzz testing for both, plus a fuzz target for the untrusted-deserialization path in `storage::db`.
+There was no way to move a `SyncEngineDb`'s state — pending payments, sequence reservations, unresolved conflicts, dispute escalations, settlement history — from one device to another. For the population StellarConduit targets (disaster-relief/displacement scenarios), losing that state because a phone was lost, broken, or replaced means losing pending offline payments that may represent emergency funds.
 
-- Adds `proptest` as a dev-dependency (justified over `quickcheck` in `Cargo.toml` and `README.md`: built-in shrinking and a richer combinator API for composing the `QueuedSlot` generators these tests need).
-- `conflict::detector::detect_conflicts`: adds `proptest_detect_conflicts_matches_naive_reference`, which cross-checks the function against a naive O(n²) reference implementation over several thousand randomly generated `QueuedSlot` batches.
-  - Writing this test surfaced a real bug: `detect_conflicts` grouped colliding slots, sorted their message IDs, and only paired up *adjacent* IDs (`ids.windows(2)`). With three or more distinct envelopes colliding on the same `(account, sequence)` slot, the pair at the ends of the sorted list (e.g. the 1st and 3rd) was never reported as a `Conflict`, even though it's a genuine double-spend pair. Fixed by enumerating all pairwise combinations within a colliding group. Added `test_three_way_collision_reports_every_pair` as a direct regression test.
-- `settlement::tracker::SettlementStatus::can_transition_to`: adds `test_settlement_transition_matrix_is_exhaustive`, checking all 25 `(from, to)` pairs across the 5 `SettlementStatus` variants against an independently hand-written reachability list (not derived from the function's own match arms, so it can actually catch a divergence).
-- Adds a `cargo-fuzz` target at `fuzz/fuzz_targets/deserialize_envelope.rs` fuzzing `rmp_serde::from_slice::<TransactionEnvelope>` — the deserialization path `SyncEngineDb` uses to read queued envelopes back out of SQLite. The fuzz crate is its own detached workspace (`fuzz/Cargo.toml` has an empty `[workspace]` table) so it doesn't affect `cargo build`/`test`/`clippy` at the repo root and isn't required in normal CI. Includes a seed corpus entry (a validly-encoded envelope) under `fuzz/corpus/deserialize_envelope/`.
-- Documents how to run the fuzz target locally and as a bounded CI-friendly smoke run in `README.md`.
+## What's here
 
-## Why
+Two new methods on `SyncEngineDb` (`src/storage/db.rs`):
 
-- `conflict::detector` and `settlement::tracker` are the two places where getting logic wrong has direct funds-safety consequences (a missed double-spend pair, or a payment reported settled when it isn't). Example-based tests can't cover the input space needed to build confidence here.
-- `SyncEngineDb` deserializes envelope bytes it reads back from its own storage. That's safe today, but once encryption-at-rest and database export/import for device migration land, those bytes may come from a removable or previously-exported file — i.e., no longer fully trusted. A fuzz target on the deserialization path builds a safety net ahead of that.
+- `export_snapshot(&self) -> Result<Vec<u8>, SyncEngineError>` — serializes every table into a single versioned MessagePack blob.
+- `import_snapshot(&self, data: &[u8]) -> Result<ImportReport, SyncEngineError>` — restores a blob produced by `export_snapshot` into this database.
 
-## Test plan
+Snapshot rows mirror table columns directly (rather than going through the domain types used elsewhere in this file, e.g. `Conflict`/`DisputeEscalation`), so the round-trip is byte-exact instead of passing through a second encode/decode step that could silently normalize or lose data.
 
-- [x] `cargo fmt --all` — clean
-- [x] `cargo clippy --all-targets --all-features -- -D warnings` — clean
-- [x] `cargo test` — all tests pass, including:
-  - [x] `proptest_detect_conflicts_matches_naive_reference` (4096 generated cases)
-  - [x] `test_settlement_transition_matrix_is_exhaustive` (all 25 pairs)
-  - [x] `test_three_way_collision_reports_every_pair` (regression for the bug found above)
-- [x] Fuzz harness compiles cleanly (`cargo +nightly build` from `fuzz/`) and a manual smoke run against the seed corpus (`./target/debug/deserialize_envelope -max_total_time=5 corpus/deserialize_envelope`) completed ~2.7M executions with zero crashes (not required in normal CI; see README for the documented `cargo fuzz run` invocations)
+## Versioning (issue #11)
+
+Issue #11 (schema versioning/migrations for `SyncEngineDb`) hadn't landed at the time this was picked up, so this adds its own minimal, standalone tag — `DB_SNAPSHOT_SCHEMA_VERSION` — scoped only to the snapshot format, rather than inventing a general migration scheme. `import_snapshot` rejects any blob whose embedded version doesn't match, via a new `SyncEngineError::IncompatibleSnapshotSchemaVersion`. If #11 lands later, this constant should be unified with its scheme, not kept as a second, competing version number.
+
+## Import policy: reject into a non-empty database
+
+`import_snapshot` **rejects the import** (`SyncEngineError::ImportTargetNotEmpty`) if the target database already contains any rows, in any table. It does not merge or overwrite.
+
+This was a deliberate choice over merge/overwrite: every table here guards financial or double-spend-sensitive state. Silently merging two `sequence_reservations` rows for the same account, or two `conflicts`/`queued_envelopes` rows, would need a conflict-resolution policy no less complex than the one `crate::conflict` already exists to implement for on-chain envelopes — inventing a second, weaker one just for import risks the exact double-spend and lost-payment hazards this crate is otherwise built to prevent. Reject-if-nonempty keeps the outcome trivially provable (`empty + snapshot = snapshot`, exactly) and matches the issue's intended use case: restoring onto a new device, whose database is normally fresh.
+
+The emptiness check and the row inserts happen inside a single SQLite transaction, so a concurrent writer landing between "check" and "insert" can't produce a partial or corrupt import — `SyncEngineDb` is designed to be shared behind an `Arc` across concurrent callers, so this isn't a hypothetical.
+
+## Interaction with encryption at rest (issue #12)
+
+Issue #12 hadn't landed either, so this format has no encryption of its own — `export_snapshot` reads and serializes whatever plaintext rows the connection can see. This is documented explicitly on both functions: **an exported snapshot is not an encrypted artifact merely because the source database is encrypted at rest.** Encryption at rest protects the on-disk SQLite file, not the output of `export_snapshot`. A snapshot is exactly as sensitive as the payment history it contains (source accounts, sequence numbers, full transaction envelopes, dispute proofs) and callers must treat it as plaintext financial data: transmit only over an encrypted channel, don't persist it unencrypted at rest, and ideally wrap it in caller-side encryption (using the same key material as #12's at-rest encryption, so a snapshot is never a plaintext copy of something the source database was encrypting) before writing it anywhere.
+
+## Interaction with stale sequence reservations (issue #8)
+
+`sequence_reservations` rows are exported and imported as-is. A sequence baseline reserved on the source device may be stale by the time it reaches the target device (e.g. the account transacted from elsewhere in the interim). This is documented as a required post-import step, not implemented here: **callers must run stale-sequence reconciliation (#8) immediately after `import_snapshot` returns and before queuing anything new** — this function has no live network access to the account and can't validate the reservation itself.
+
+## Corrupted / truncated input
+
+A `data` blob that isn't a valid, complete snapshot encoding fails with `SyncEngineError::DeserializationError` before anything is written — there's no partial-write state to reason about, and no panic path.
+
+## Testing
+
+Required tests, all in `src/storage/db.rs`:
+- `test_export_import_roundtrip_is_lossless` — seeds every table, exports, imports into a fresh database, and asserts every table matches exactly (including `DbSummary`, ordered comparisons for envelopes/conflicts/escalations/history/reservations).
+- `test_import_into_nonempty_db_follows_documented_policy` — importing into a database with existing rows returns `ImportTargetNotEmpty`, and neither the target's pre-existing rows nor the snapshot's rows are mutated.
+- `test_import_rejects_corrupted_snapshot` — both garbage bytes and a truncated real snapshot fail with `DeserializationError`, and nothing is written either time.
+- `test_import_rejects_incompatible_schema_version` — a snapshot tagged with `DB_SNAPSHOT_SCHEMA_VERSION + 1` is rejected with `IncompatibleSnapshotSchemaVersion` before any table is touched.
+
+```
+cargo fmt --all -- --check                          # clean
+cargo clippy --all-targets -- -D warnings           # clean
+cargo test                                           # 172 unit + 13 integration passed, 0 failed
+```
+
+Note: this repo's pinned `stellarconduit-core` git dependency fails to build natively on macOS (`mdns-sd` is gated to `cfg(target_os = "linux")` in its `Cargo.toml`, but two of its modules use it unconditionally with no matching `#[cfg]`). This is pre-existing on `main` and unrelated to this change — verified via a temporary local-only patch to the cached dependency checkout (reverted afterward, nothing in this repo touched) since CI runs on `ubuntu-latest` where it's a non-issue.
+
+## Commits
+
+1. `errors: add error variants for snapshot export/import`
+2. `storage: implement snapshot export/import for device migration`
+3. `storage: add required tests for snapshot export/import`

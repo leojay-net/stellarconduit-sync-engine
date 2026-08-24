@@ -85,15 +85,17 @@ jobs:
           tool: cargo
           output-file-path: bench_output.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: true
+          auto-push: false
           # Results are pushed to the gh-pages branch under bench/ so
           # the benchmark history page stays live between PRs.
+          # auto-push set to false until gh-pages branch is created
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: bench
 
       - name: Compare benchmark results against base (PR only)
         if: github.event_name == 'pull_request'
         uses: benchmark-action/github-action-benchmark@v1
+        continue-on-error: true
         with:
           name: Sync Engine Benchmarks
           tool: cargo
