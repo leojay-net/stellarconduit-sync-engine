@@ -137,7 +137,10 @@
 //! - It will not re-noise a cached window because a caller asked nicely.
 //! - It will not, on budget exhaustion, return the raw atomics.
 
+use std::fmt::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Plain-data snapshot of all counters at a point in time.
 ///
@@ -313,195 +316,7 @@ impl SyncEngineMetrics {
 
         output
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_snapshot_reflects_current_values() {
-        let metrics = SyncEngineMetrics::new();
-
-        // Increment some counters
-        metrics.queued_total.fetch_add(10, Ordering::Relaxed);
-        metrics.settled_total.fetch_add(5, Ordering::Relaxed);
-        metrics.failed_total.fetch_add(2, Ordering::Relaxed);
-        metrics.conflicts_detected.fetch_add(3, Ordering::Relaxed);
-        metrics.disputes_escalated.fetch_add(1, Ordering::Relaxed);
-        metrics.queue_evictions.fetch_add(4, Ordering::Relaxed);
-
-        let snapshot = metrics.snapshot();
-
-        assert_eq!(snapshot.queued_total, 10);
-        assert_eq!(snapshot.settled_total, 5);
-        assert_eq!(snapshot.failed_total, 2);
-        assert_eq!(snapshot.conflicts_detected, 3);
-        assert_eq!(snapshot.disputes_escalated, 1);
-        assert_eq!(snapshot.queue_evictions, 4);
-    }
-
-    #[test]
-    fn test_prometheus_output_is_well_formed() {
-        let metrics = SyncEngineMetrics::new();
-
-        metrics.queued_total.fetch_add(42, Ordering::Relaxed);
-        metrics.settled_total.fetch_add(17, Ordering::Relaxed);
-
-        let output = metrics.to_prometheus_text();
-
-        // Verify it contains required Prometheus format elements
-        assert!(output.contains("# TYPE stellarconduit_sync_queued_total counter"));
-        assert!(output.contains("# HELP stellarconduit_sync_queued_total"));
-        assert!(output.contains("stellarconduit_sync_queued_total 42"));
-        assert!(output.contains("stellarconduit_sync_settled_total 17"));
-
-        // Verify each metric has TYPE and HELP lines
-        assert!(output.contains("# TYPE stellarconduit_sync_settled_total counter"));
-        assert!(output.contains("# TYPE stellarconduit_sync_failed_total counter"));
-        assert!(output.contains("# TYPE stellarconduit_sync_conflicts_detected_total counter"));
-        assert!(output.contains("# TYPE stellarconduit_sync_disputes_escalated_total counter"));
-        assert!(output.contains("# TYPE stellarconduit_sync_queue_evictions_total counter"));
-
-        // Verify metric names follow Prometheus naming conventions
-        // (letters, numbers, underscores, and colons allowed)
-        assert!(!output.contains("stellarconduit-sync")); // no hyphens
-        assert!(output.contains("_total")); // counter suffix
-
-        // Verify each line ends with newline
-        for line in output.lines() {
-            assert!(!line.is_empty() || line.starts_with('#') || line.contains(' '));
-        }
-    }
-
-    #[test]
-    fn test_snapshot_and_reset_zeroes_counters() {
-        let metrics = SyncEngineMetrics::new();
-
-        // Set some values
-        metrics.queued_total.fetch_add(10, Ordering::Relaxed);
-        metrics.settled_total.fetch_add(5, Ordering::Relaxed);
-        metrics.failed_total.fetch_add(2, Ordering::Relaxed);
-        metrics.conflicts_detected.fetch_add(3, Ordering::Relaxed);
-        metrics.disputes_escalated.fetch_add(1, Ordering::Relaxed);
-        metrics.queue_evictions.fetch_add(4, Ordering::Relaxed);
-
-        // Capture snapshot and reset
-        let snapshot = metrics.snapshot_and_reset();
-
-        // Verify snapshot has the values before reset
-        assert_eq!(snapshot.queued_total, 10);
-        assert_eq!(snapshot.settled_total, 5);
-        assert_eq!(snapshot.failed_total, 2);
-        assert_eq!(snapshot.conflicts_detected, 3);
-        assert_eq!(snapshot.disputes_escalated, 1);
-        assert_eq!(snapshot.queue_evictions, 4);
-
-        // Verify all counters are now zero
-        let after_snapshot = metrics.snapshot();
-        assert_eq!(after_snapshot.queued_total, 0);
-        assert_eq!(after_snapshot.settled_total, 0);
-        assert_eq!(after_snapshot.failed_total, 0);
-        assert_eq!(after_snapshot.conflicts_detected, 0);
-        assert_eq!(after_snapshot.disputes_escalated, 0);
-        assert_eq!(after_snapshot.queue_evictions, 0);
-    }
-
-    #[test]
-    fn test_default_metrics_are_zero() {
-        let metrics = SyncEngineMetrics::default();
-        let snapshot = metrics.snapshot();
-
-        assert_eq!(snapshot.queued_total, 0);
-        assert_eq!(snapshot.settled_total, 0);
-        assert_eq!(snapshot.failed_total, 0);
-        assert_eq!(snapshot.conflicts_detected, 0);
-        assert_eq!(snapshot.disputes_escalated, 0);
-        assert_eq!(snapshot.queue_evictions, 0);
-    }
-
-    #[test]
-    fn test_prometheus_output_with_zero_values() {
-        let metrics = SyncEngineMetrics::new();
-        let output = metrics.to_prometheus_text();
-
-        // Should still output all metrics with zero values
-        assert!(output.contains("stellarconduit_sync_queued_total 0"));
-        assert!(output.contains("stellarconduit_sync_settled_total 0"));
-        assert!(output.contains("stellarconduit_sync_failed_total 0"));
-        assert!(output.contains("stellarconduit_sync_conflicts_detected_total 0"));
-        assert!(output.contains("stellarconduit_sync_disputes_escalated_total 0"));
-        assert!(output.contains("stellarconduit_sync_queue_evictions_total 0"));
-    }
-
-    #[test]
-    fn test_snapshot_is_independent_of_future_changes() {
-        let metrics = SyncEngineMetrics::new();
-
-        metrics.queued_total.fetch_add(10, Ordering::Relaxed);
-        let snapshot1 = metrics.snapshot();
-
-        metrics.queued_total.fetch_add(5, Ordering::Relaxed);
-        let snapshot2 = metrics.snapshot();
-
-        // First snapshot should not be affected by later changes
-        assert_eq!(snapshot1.queued_total, 10);
-        assert_eq!(snapshot2.queued_total, 15);
-    }
-
-    #[test]
-    fn test_multiple_resets_accumulate_correctly() {
-        let metrics = SyncEngineMetrics::new();
-
-        // First period
-        metrics.queued_total.fetch_add(10, Ordering::Relaxed);
-        let period1 = metrics.snapshot_and_reset();
-        assert_eq!(period1.queued_total, 10);
-
-        // Second period
-        metrics.queued_total.fetch_add(5, Ordering::Relaxed);
-        let period2 = metrics.snapshot_and_reset();
-        assert_eq!(period2.queued_total, 5);
-
-        // Verify both periods are tracked independently
-        assert_eq!(period1.queued_total, 10);
-        assert_eq!(period2.queued_total, 5);
-    }
-
-    #[test]
-    fn test_prometheus_metric_names_follow_conventions() {
-        let metrics = SyncEngineMetrics::new();
-        let output = metrics.to_prometheus_text();
-
-        // Extract all metric names
-        let metric_names: Vec<&str> = output
-            .lines()
-            .filter(|line| !line.starts_with('#') && !line.is_empty())
-            .map(|line| line.split_whitespace().next().unwrap())
-            .collect();
-
-        // Verify all metric names match Prometheus naming conventions
-        // Must match regex: [a-zA-Z_:][a-zA-Z0-9_:]*
-        for name in metric_names {
-            assert!(
-                name.chars()
-                    .all(|c| c.is_alphanumeric() || c == '_' || c == ':'),
-                "Metric name '{}' contains invalid characters",
-                name
-            );
-            assert!(
-                name.chars()
-                    .next()
-                    .map(|c| c.is_alphabetic() || c == '_' || c == ':')
-                    .unwrap_or(false),
-                "Metric name '{}' must start with letter, underscore, or colon",
-                name
-            );
-        }
-    }
-}
-
-impl SyncEngineMetrics {
     /// Record one newly-queued envelope.
     pub fn record_queued(&self) {
         self.queued_total.fetch_add(1, Ordering::Relaxed);
@@ -916,6 +731,187 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
+
+    #[test]
+    fn test_snapshot_reflects_current_values() {
+        let metrics = SyncEngineMetrics::new();
+
+        // Increment some counters
+        metrics.queued_total.fetch_add(10, Ordering::Relaxed);
+        metrics.settled_total.fetch_add(5, Ordering::Relaxed);
+        metrics.failed_total.fetch_add(2, Ordering::Relaxed);
+        metrics.conflicts_detected.fetch_add(3, Ordering::Relaxed);
+        metrics.disputes_escalated.fetch_add(1, Ordering::Relaxed);
+        metrics.queue_evictions.fetch_add(4, Ordering::Relaxed);
+
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(snapshot.queued_total, 10);
+        assert_eq!(snapshot.settled_total, 5);
+        assert_eq!(snapshot.failed_total, 2);
+        assert_eq!(snapshot.conflicts_detected, 3);
+        assert_eq!(snapshot.disputes_escalated, 1);
+        assert_eq!(snapshot.queue_evictions, 4);
+    }
+
+    #[test]
+    fn test_prometheus_output_is_well_formed() {
+        let metrics = SyncEngineMetrics::new();
+
+        metrics.queued_total.fetch_add(42, Ordering::Relaxed);
+        metrics.settled_total.fetch_add(17, Ordering::Relaxed);
+
+        let output = metrics.to_prometheus_text();
+
+        // Verify it contains required Prometheus format elements
+        assert!(output.contains("# TYPE stellarconduit_sync_queued_total counter"));
+        assert!(output.contains("# HELP stellarconduit_sync_queued_total"));
+        assert!(output.contains("stellarconduit_sync_queued_total 42"));
+        assert!(output.contains("stellarconduit_sync_settled_total 17"));
+
+        // Verify each metric has TYPE and HELP lines
+        assert!(output.contains("# TYPE stellarconduit_sync_settled_total counter"));
+        assert!(output.contains("# TYPE stellarconduit_sync_failed_total counter"));
+        assert!(output.contains("# TYPE stellarconduit_sync_conflicts_detected_total counter"));
+        assert!(output.contains("# TYPE stellarconduit_sync_disputes_escalated_total counter"));
+        assert!(output.contains("# TYPE stellarconduit_sync_queue_evictions_total counter"));
+
+        // Verify metric names follow Prometheus naming conventions
+        // (letters, numbers, underscores, and colons allowed)
+        assert!(!output.contains("stellarconduit-sync")); // no hyphens
+        assert!(output.contains("_total")); // counter suffix
+
+        // Verify each line ends with newline
+        for line in output.lines() {
+            assert!(!line.is_empty() || line.starts_with('#') || line.contains(' '));
+        }
+    }
+
+    #[test]
+    fn test_snapshot_and_reset_zeroes_counters() {
+        let metrics = SyncEngineMetrics::new();
+
+        // Set some values
+        metrics.queued_total.fetch_add(10, Ordering::Relaxed);
+        metrics.settled_total.fetch_add(5, Ordering::Relaxed);
+        metrics.failed_total.fetch_add(2, Ordering::Relaxed);
+        metrics.conflicts_detected.fetch_add(3, Ordering::Relaxed);
+        metrics.disputes_escalated.fetch_add(1, Ordering::Relaxed);
+        metrics.queue_evictions.fetch_add(4, Ordering::Relaxed);
+
+        // Capture snapshot and reset
+        let snapshot = metrics.snapshot_and_reset();
+
+        // Verify snapshot has the values before reset
+        assert_eq!(snapshot.queued_total, 10);
+        assert_eq!(snapshot.settled_total, 5);
+        assert_eq!(snapshot.failed_total, 2);
+        assert_eq!(snapshot.conflicts_detected, 3);
+        assert_eq!(snapshot.disputes_escalated, 1);
+        assert_eq!(snapshot.queue_evictions, 4);
+
+        // Verify all counters are now zero
+        let after_snapshot = metrics.snapshot();
+        assert_eq!(after_snapshot.queued_total, 0);
+        assert_eq!(after_snapshot.settled_total, 0);
+        assert_eq!(after_snapshot.failed_total, 0);
+        assert_eq!(after_snapshot.conflicts_detected, 0);
+        assert_eq!(after_snapshot.disputes_escalated, 0);
+        assert_eq!(after_snapshot.queue_evictions, 0);
+    }
+
+    #[test]
+    fn test_default_metrics_are_zero() {
+        let metrics = SyncEngineMetrics::default();
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(snapshot.queued_total, 0);
+        assert_eq!(snapshot.settled_total, 0);
+        assert_eq!(snapshot.failed_total, 0);
+        assert_eq!(snapshot.conflicts_detected, 0);
+        assert_eq!(snapshot.disputes_escalated, 0);
+        assert_eq!(snapshot.queue_evictions, 0);
+    }
+
+    #[test]
+    fn test_prometheus_output_with_zero_values() {
+        let metrics = SyncEngineMetrics::new();
+        let output = metrics.to_prometheus_text();
+
+        // Should still output all metrics with zero values
+        assert!(output.contains("stellarconduit_sync_queued_total 0"));
+        assert!(output.contains("stellarconduit_sync_settled_total 0"));
+        assert!(output.contains("stellarconduit_sync_failed_total 0"));
+        assert!(output.contains("stellarconduit_sync_conflicts_detected_total 0"));
+        assert!(output.contains("stellarconduit_sync_disputes_escalated_total 0"));
+        assert!(output.contains("stellarconduit_sync_queue_evictions_total 0"));
+    }
+
+    #[test]
+    fn test_snapshot_is_independent_of_future_changes() {
+        let metrics = SyncEngineMetrics::new();
+
+        metrics.queued_total.fetch_add(10, Ordering::Relaxed);
+        let snapshot1 = metrics.snapshot();
+
+        metrics.queued_total.fetch_add(5, Ordering::Relaxed);
+        let snapshot2 = metrics.snapshot();
+
+        // First snapshot should not be affected by later changes
+        assert_eq!(snapshot1.queued_total, 10);
+        assert_eq!(snapshot2.queued_total, 15);
+    }
+
+    #[test]
+    fn test_multiple_resets_accumulate_correctly() {
+        let metrics = SyncEngineMetrics::new();
+
+        // First period
+        metrics.queued_total.fetch_add(10, Ordering::Relaxed);
+        let period1 = metrics.snapshot_and_reset();
+        assert_eq!(period1.queued_total, 10);
+
+        // Second period
+        metrics.queued_total.fetch_add(5, Ordering::Relaxed);
+        let period2 = metrics.snapshot_and_reset();
+        assert_eq!(period2.queued_total, 5);
+
+        // Verify both periods are tracked independently
+        assert_eq!(period1.queued_total, 10);
+        assert_eq!(period2.queued_total, 5);
+    }
+
+    #[test]
+    fn test_prometheus_metric_names_follow_conventions() {
+        let metrics = SyncEngineMetrics::new();
+        let output = metrics.to_prometheus_text();
+
+        // Extract all metric names
+        let metric_names: Vec<&str> = output
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .map(|line| line.split_whitespace().next().unwrap())
+            .collect();
+
+        // Verify all metric names match Prometheus naming conventions
+        // Must match regex: [a-zA-Z_:][a-zA-Z0-9_:]*
+        for name in metric_names {
+            assert!(
+                name.chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == ':'),
+                "Metric name '{}' contains invalid characters",
+                name
+            );
+            assert!(
+                name.chars()
+                    .next()
+                    .map(|c| c.is_alphabetic() || c == '_' || c == ':')
+                    .unwrap_or(false),
+                "Metric name '{}' must start with letter, underscore, or colon",
+                name
+            );
+        }
+    }
 
     fn test_exporter(config: DpExportConfig, seed: u64, clock: Arc<AtomicU64>) -> DpExporter {
         DpExporter::from_parts(
