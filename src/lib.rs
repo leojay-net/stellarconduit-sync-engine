@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod clock;
 pub mod conflict;
+pub mod encryption;
 pub mod engine;
 pub mod envelope;
 pub mod errors;

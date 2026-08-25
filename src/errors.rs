@@ -121,6 +121,21 @@ pub enum SyncEngineError {
     #[error("post-quantum signature verification failed")]
     PqVerificationFailed,
 
+    /// Returned when encryption or decryption operations fail.
+    #[error("encryption error: {0}")]
+    EncryptionError(String),
+
+    /// Returned when attempting to open an encrypted database without
+    /// providing the correct key, or when attempting to open an unencrypted
+    /// database as if it were encrypted.
+    #[error("database encryption key mismatch or missing key")]
+    EncryptionKeyMismatch,
+
+    /// Returned when an encrypted database is opened with a key that doesn't
+    /// match the one used to create it.
+    #[error("decryption failed: wrong key or corrupted data")]
+    DecryptionFailed,
+
     /// Returned by `SyncEngineDb::import_snapshot` when the target database
     /// already contains rows in any of its tables. Import is documented and
     /// implemented as reject-if-nonempty (see that function's doc comment for
@@ -191,6 +206,9 @@ impl SyncEngineError {
             SyncEngineError::SerializationError(_) => ErrorClass::Permanent,
             SyncEngineError::DeserializationError(_) => ErrorClass::Permanent,
             SyncEngineError::PqVerificationFailed => ErrorClass::Permanent,
+            SyncEngineError::EncryptionError(_) => ErrorClass::Permanent,
+            SyncEngineError::EncryptionKeyMismatch => ErrorClass::Permanent,
+            SyncEngineError::DecryptionFailed => ErrorClass::Permanent,
             SyncEngineError::ImportTargetNotEmpty => ErrorClass::Permanent,
             SyncEngineError::IncompatibleSnapshotSchemaVersion { .. } => ErrorClass::Permanent,
 
@@ -256,6 +274,9 @@ mod tests {
             SyncEngineError::SerializationError(rmp_serde::encode::Error::UnknownLength),
             SyncEngineError::DeserializationError(rmp_serde::decode::Error::Syntax("test".into())),
             SyncEngineError::PqVerificationFailed,
+            SyncEngineError::EncryptionError("test encryption error".into()),
+            SyncEngineError::EncryptionKeyMismatch,
+            SyncEngineError::DecryptionFailed,
             SyncEngineError::ImportTargetNotEmpty,
             SyncEngineError::IncompatibleSnapshotSchemaVersion {
                 found: 1,
