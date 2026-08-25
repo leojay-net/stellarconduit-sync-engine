@@ -72,6 +72,9 @@ pub enum SyncEngineError {
     #[error("invalid dispatch window configuration: {0}")]
     InvalidDispatchWindow(String),
 
+    #[error("invalid envelope expiry policy: {0}")]
+    InvalidExpiryPolicy(String),
+
     #[error("conflict between envelopes could not be resolved off-chain: {0}")]
     UnresolvedConflict(String),
 
@@ -225,6 +228,7 @@ impl SyncEngineError {
     /// | `BackpressureWindowFull` | Transient | The per-relay dispatch window is at capacity. Acks landing or timeout releases will free slots; retrying after a short back-off is exactly the intended behaviour. |
     /// | `DuplicateInFlight` | Permanent | The same message was acquired into the dispatch window twice without an intervening release. This is a caller bug; retrying identical inputs reproduces it. |
     /// | `InvalidDispatchWindow` | Permanent | The window configuration violates an invariant (zero capacity or zero timeout). Fix the configuration and construct again. |
+    /// | `InvalidExpiryPolicy` | Permanent | The expiry policy configuration violates an invariant (inverted urgency ordering, zero window, or above the sanity ceiling). The same configuration will be rejected on every attempt; the caller must fix the policy before constructing it again. |
     /// | `UnresolvedConflict` | RequiresEscalation | Two envelopes compete for the same account/sequence slot and could not be resolved off-chain. Neither retrying nor giving up is correct — the dispute must be escalated to the on-chain `dispute-resolver` contract (see issue #002). |
     /// | `VrfTiebreak` | Permanent | A supplied VRF tie-break proof is malformed, fails verification, or came from the wrong evaluator. The same bytes will fail the same way on every attempt; the resolution flow treats a tie with no valid tie-break as an ordinary `UnresolvedConflict` and escalates. |
     /// | `CompressedProofInvalid` | Permanent | A compressed relay-chain proof (issue #63) failed to fold or verify. The same artifact fails identically on every attempt; a well-formed proof must be produced, or the escalation must fall back to the raw per-hop proofs. |
@@ -255,6 +259,7 @@ impl SyncEngineError {
             SyncEngineError::BackpressureWindowFull { .. } => ErrorClass::Transient,
             SyncEngineError::DuplicateInFlight => ErrorClass::Permanent,
             SyncEngineError::InvalidDispatchWindow(_) => ErrorClass::Permanent,
+            SyncEngineError::InvalidExpiryPolicy(_) => ErrorClass::Permanent,
             SyncEngineError::UnknownMultisigSigner { .. } => ErrorClass::Permanent,
             SyncEngineError::MultisigThresholdNotMet { .. } => ErrorClass::Permanent,
             SyncEngineError::SerializationError(_) => ErrorClass::Permanent,
