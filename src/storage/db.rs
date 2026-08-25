@@ -451,9 +451,10 @@ impl SyncEngineDb {
         if let Some(encrypted_bytes) = test_decrypt {
             // Try to decrypt with the provided key
             let encrypted = EncryptedData::from_bytes(encrypted_bytes);
-            let key = self.encryption_key.as_ref().ok_or_else(|| {
-                SyncEngineError::EncryptionKeyMismatch
-            })?;
+            let key = self
+                .encryption_key
+                .as_ref()
+                .ok_or_else(|| SyncEngineError::EncryptionKeyMismatch)?;
 
             match encrypted.decrypt(key) {
                 Ok(_) => Ok(()), // Key is valid
@@ -497,7 +498,7 @@ impl SyncEngineDb {
     ) -> Result<(), SyncEngineError> {
         let message_id = envelope.message_id.to_vec();
         let envelope_bytes = rmp_serde::to_vec(envelope)?;
-        
+
         // Encrypt envelope_bytes if encryption is enabled
         let envelope_bytes = if let Some(ref key) = self.encryption_key {
             let encrypted = EncryptedData::encrypt(&envelope_bytes, key)?;
@@ -505,7 +506,7 @@ impl SyncEngineDb {
         } else {
             envelope_bytes
         };
-        
+
         let source_account = source_account.to_string();
         let priority: i64 = priority.into();
 
@@ -552,10 +553,10 @@ impl SyncEngineDb {
     ) -> Result<(), SyncEngineError> {
         let message_id = envelope.message_id.to_vec();
         let envelope_bytes = rmp_serde::to_vec(envelope)?;
-        
+
         // Encrypt envelope_bytes if encryption is enabled
         let envelope_bytes = self.encrypt_if_enabled(&envelope_bytes)?;
-        
+
         let source_account = source_account.to_string();
         let priority: i64 = priority.into();
         let status = SettlementStatus::Queued.as_str().to_string();
@@ -2313,7 +2314,6 @@ mod tests {
             other => panic!("expected IncompatibleSnapshotSchemaVersion, got {other:?}"),
         }
     }
-}
 
     // ── Encryption at rest tests ─────────────────────────────────────────────
 
@@ -2328,7 +2328,9 @@ mod tests {
         let salt = generate_salt();
         let key = EncryptionKey::from_passphrase("test passphrase", &salt).unwrap();
 
-        let db = SyncEngineDb::init_with_encryption(db_path, key).await.unwrap();
+        let db = SyncEngineDb::init_with_encryption(db_path, key)
+            .await
+            .unwrap();
 
         // Store envelope with known plaintext
         let envelope = mock_envelope(1);
@@ -2345,7 +2347,9 @@ mod tests {
 
         // The plaintext should NOT appear anywhere in the file
         assert!(
-            !file_bytes.windows(plaintext_xdr.len()).any(|w| w == plaintext_xdr.as_bytes()),
+            !file_bytes
+                .windows(plaintext_xdr.len())
+                .any(|w| w == plaintext_xdr.as_bytes()),
             "Plaintext transaction XDR found in database file - encryption failed!"
         );
     }
@@ -2362,7 +2366,9 @@ mod tests {
         let key = EncryptionKey::from_passphrase("correct passphrase", &salt).unwrap();
 
         // Write with key
-        let db = SyncEngineDb::init_with_encryption(db_path, key.clone()).await.unwrap();
+        let db = SyncEngineDb::init_with_encryption(db_path, key.clone())
+            .await
+            .unwrap();
         let envelope = mock_envelope(42);
         db.enqueue_envelope(&envelope, "GTEST", 123, TxPriority::Normal, 1000)
             .await
@@ -2370,7 +2376,9 @@ mod tests {
         drop(db);
 
         // Reopen with same key
-        let db2 = SyncEngineDb::init_with_encryption(db_path, key).await.unwrap();
+        let db2 = SyncEngineDb::init_with_encryption(db_path, key)
+            .await
+            .unwrap();
         let retrieved = db2.get_queued_envelope([42u8; 32]).await.unwrap();
 
         assert!(retrieved.is_some());
@@ -2393,7 +2401,9 @@ mod tests {
         let wrong_key = EncryptionKey::from_passphrase("wrong passphrase", &salt).unwrap();
 
         // Write with correct key
-        let db = SyncEngineDb::init_with_encryption(db_path, correct_key).await.unwrap();
+        let db = SyncEngineDb::init_with_encryption(db_path, correct_key)
+            .await
+            .unwrap();
         db.enqueue_envelope(&mock_envelope(1), "GTEST", 101, TxPriority::Normal, 1000)
             .await
             .unwrap();
@@ -2404,10 +2414,9 @@ mod tests {
         assert!(
             matches!(result, Err(SyncEngineError::EncryptionKeyMismatch)),
             "Expected EncryptionKeyMismatch error, got {:?}",
-            result
+            result.as_ref().err()
         );
     }
-
 
     #[tokio::test]
     async fn test_missing_key_on_encrypted_db_errors_clearly() {
@@ -2421,7 +2430,9 @@ mod tests {
         let key = EncryptionKey::from_passphrase("test passphrase", &salt).unwrap();
 
         // Create encrypted database
-        let db = SyncEngineDb::init_with_encryption(db_path, key).await.unwrap();
+        let db = SyncEngineDb::init_with_encryption(db_path, key)
+            .await
+            .unwrap();
         db.enqueue_envelope(&mock_envelope(1), "GTEST", 101, TxPriority::Normal, 1000)
             .await
             .unwrap();
@@ -2437,3 +2448,4 @@ mod tests {
             "Expected error or None when reading encrypted DB without key"
         );
     }
+}

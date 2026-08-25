@@ -88,7 +88,10 @@ impl EncryptionKey {
     /// - Uses Argon2id (memory-hard PBKDF) to resist GPU/ASIC attacks
     /// - Salt prevents rainbow table attacks
     /// - Memory cost tuned for mobile devices (64 MB)
-    pub fn from_passphrase(passphrase: &str, salt: &[u8; SALT_SIZE]) -> Result<Self, SyncEngineError> {
+    pub fn from_passphrase(
+        passphrase: &str,
+        salt: &[u8; SALT_SIZE],
+    ) -> Result<Self, SyncEngineError> {
         let mut key = [0u8; KEY_SIZE];
 
         let params = Params::new(
@@ -103,7 +106,9 @@ impl EncryptionKey {
 
         argon2
             .hash_password_into(passphrase.as_bytes(), salt, &mut key)
-            .map_err(|e| SyncEngineError::EncryptionError(format!("Key derivation failed: {}", e)))?;
+            .map_err(|e| {
+                SyncEngineError::EncryptionError(format!("Key derivation failed: {}", e))
+            })?;
 
         Ok(Self { key })
     }
@@ -315,7 +320,10 @@ mod tests {
         assert_ne!(encrypted1.as_bytes(), encrypted2.as_bytes());
 
         // But both should decrypt to the same plaintext
-        assert_eq!(encrypted1.decrypt(&key).unwrap(), encrypted2.decrypt(&key).unwrap());
+        assert_eq!(
+            encrypted1.decrypt(&key).unwrap(),
+            encrypted2.decrypt(&key).unwrap()
+        );
     }
 
     #[test]
