@@ -63,6 +63,15 @@ pub enum SyncEngineError {
     #[error("invalid settlement state transition from {from:?} to {to:?}")]
     InvalidStateTransition { from: String, to: String },
 
+    #[error("dispatch backpressure window is full ({max_in_flight} in flight); wait for acknowledgments or timeouts before dispatching more")]
+    BackpressureWindowFull { max_in_flight: usize },
+
+    #[error("message is already in flight in the dispatch window")]
+    DuplicateInFlight,
+
+    #[error("invalid dispatch window configuration: {0}")]
+    InvalidDispatchWindow(String),
+
     #[error("conflict between envelopes could not be resolved off-chain: {0}")]
     UnresolvedConflict(String),
 
@@ -179,6 +188,9 @@ impl SyncEngineError {
     /// | `SequenceMismatch` | Permanent | The reserved sequence number doesn't match the one encoded in the transaction XDR. Retrying without correcting the sequence or the XDR will reproduce the same mismatch. |
     /// | `EnvelopeNotFound` | Permanent | A lookup by `message_id` returned nothing. The envelope was never enqueued, or has already been removed. Retrying the same lookup against the same DB will not materialise it. |
     /// | `InvalidStateTransition` | Permanent | A state-machine transition was attempted that is not in the legal transition graph. Retrying the same transition will never become legal; the caller has a logic bug. |
+    /// | `BackpressureWindowFull` | Transient | The per-relay dispatch window is at capacity. Acks landing or timeout releases will free slots; retrying after a short back-off is exactly the intended behaviour. |
+    /// | `DuplicateInFlight` | Permanent | The same message was acquired into the dispatch window twice without an intervening release. This is a caller bug; retrying identical inputs reproduces it. |
+    /// | `InvalidDispatchWindow` | Permanent | The window configuration violates an invariant (zero capacity or zero timeout). Fix the configuration and construct again. |
     /// | `UnresolvedConflict` | RequiresEscalation | Two envelopes compete for the same account/sequence slot and could not be resolved off-chain. Neither retrying nor giving up is correct — the dispute must be escalated to the on-chain `dispute-resolver` contract (see issue #002). |
     /// | `EmergencyQueueLimitExceeded` | RequiresEscalation | The spending guard has tripped. A simple retry without user re-confirmation would be a security bypass. The embedding wallet must surface this to the user (biometric re-auth or explicit override) before queuing is retried. |
     /// | `UnknownMultisigSigner` | Permanent | The presented signing key is not in the account's authorised signer set. No retry will change the signer registry without an explicit key-management operation. |
@@ -201,6 +213,9 @@ impl SyncEngineError {
             SyncEngineError::SequenceMismatch { .. } => ErrorClass::Permanent,
             SyncEngineError::EnvelopeNotFound(_) => ErrorClass::Permanent,
             SyncEngineError::InvalidStateTransition { .. } => ErrorClass::Permanent,
+            SyncEngineError::BackpressureWindowFull { .. } => ErrorClass::Transient,
+            SyncEngineError::DuplicateInFlight => ErrorClass::Permanent,
+            SyncEngineError::InvalidDispatchWindow(_) => ErrorClass::Permanent,
             SyncEngineError::UnknownMultisigSigner { .. } => ErrorClass::Permanent,
             SyncEngineError::MultisigThresholdNotMet { .. } => ErrorClass::Permanent,
             SyncEngineError::SerializationError(_) => ErrorClass::Permanent,
