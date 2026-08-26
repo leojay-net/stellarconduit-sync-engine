@@ -149,6 +149,14 @@ path = "tests/integration/engine_restart_test.rs"
 name = "cli_test"
 path = "tests/integration/cli_test.rs"
 
+[[test]]
+name = "adversarial_agents_test"
+path = "tests/sim/adversarial_agents_test.rs"
+
+[[test]]
+name = "adversarial_sweep"
+path = "tests/sim/adversarial_sweep.rs"
+
 [[bin]]
 name = "sync-engine-cli"
 path = "src/bin/sync-engine-cli.rs"
