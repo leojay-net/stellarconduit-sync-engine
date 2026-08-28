@@ -1,6 +1,7 @@
 pub mod detector;
 pub mod escalation;
 pub mod quorum;
+pub mod reconciliation;
 pub mod resolver;
 
 pub use detector::{
@@ -8,6 +9,9 @@ pub use detector::{
 };
 pub use escalation::{build_escalation, DisputeEscalation, EscalationInput};
 pub use quorum::{resolve_by_quorum, QuorumResult};
+pub use reconciliation::{
+    classify as classify_divergence, reconverge, DivergenceClass, Reconvergence, ResolutionSummary,
+};
 pub use resolver::{
     resolve_conflict, resolve_nway_conflict, CandidateEvidence, ConflictEvidence, RelayObservation,
 };
