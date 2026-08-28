@@ -38,6 +38,9 @@ use ed25519_dalek::VerifyingKey;
 use stellarconduit_core::message::relay_proof::RelayChainProof;
 
 use crate::conflict::detector::{Conflict, NWayConflict};
+use crate::conflict::vrf_tiebreak::{
+    verify_tiebreak_with_evaluator, RelayVrfIdentity, TiebreakOutcome,
+};
 use crate::errors::SyncEngineError;
 
 /// Minimum number of *distinct* relays whose valid, verified relay-chain
@@ -140,8 +143,16 @@ fn count_distinct_valid_relays(
 ///      one — can never win a conflict outright, satisfying "a single relay
 ///      lying or being compromised must not be enough to win a conflict";
 ///    - the strict-majority requirement means a tie at any count (0-vs-0,
-///      2-vs-2, 3-vs-3, ...) is *never* decided — it falls through to
-///      `Err(UnresolvedConflict)` rather than an arbitrary guess.
+///      2-vs-2, 3-vs-3, ...) is *never* decided by this function — it falls
+///      through to `Err(UnresolvedConflict)` rather than an arbitrary guess.
+///
+///    A **quorum-met tie** (both sides ≥ [`MIN_QUORUM`] and exactly equal) is
+///    the one case where a further, last-resort criterion applies: the VRF
+///    tie-break of issue #067. `resolve_conflict` itself stays pure and still
+///    returns `Err` for it; [`resolve_conflict_with_tiebreak`] is the entry
+///    point that consults the tie-break, and [`quorum_standing`] exposes the
+///    distinction. Every other `Err` from here (under-evidenced, lone relay)
+///    escalates on-chain with no tie-break.
 /// 4. **Envelope timestamps are recorded, not decisive.** `evidence`'s
 ///    timestamps are included in the `UnresolvedConflict` message (useful
 ///    context for the on-chain escalation path) but never influence which
@@ -160,40 +171,165 @@ pub fn resolve_conflict(
     conflict: &Conflict,
     evidence: &ConflictEvidence,
 ) -> Result<[u8; 32], SyncEngineError> {
-    let relays_a = count_distinct_valid_relays(
+    let (standing, n_a, n_b) = standing_with_counts(conflict, evidence);
+    match standing {
+        QuorumStanding::Decisive(winner) => Ok(winner),
+        QuorumStanding::QuorumTie { .. } | QuorumStanding::Insufficient { .. } => {
+            Err(SyncEngineError::UnresolvedConflict(format!(
+                "conflict on account {} sequence {} between {} (timestamp {}, {} verified distinct \
+                 relay(s)) and {} (timestamp {}, {} verified distinct relay(s)) could not be \
+                 resolved off-chain: a winning side needs at least {} distinct corroborating \
+                 relays and strictly more than the other side",
+                conflict.source_account,
+                conflict.sequence,
+                hex::encode(conflict.envelope_a),
+                evidence.envelope_a_timestamp,
+                n_a,
+                hex::encode(conflict.envelope_b),
+                evidence.envelope_b_timestamp,
+                n_b,
+                MIN_QUORUM,
+            )))
+        }
+    }
+}
+
+/// How `conflict` stands on relay-quorum evidence alone — the result of steps
+/// 1–3 of [`resolve_conflict`]'s decision procedure, exposed so the VRF
+/// tie-break layer (issue #067) can tell a genuine quorum-met tie (its only
+/// valid trigger) apart from a merely under-evidenced conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuorumStanding {
+    /// One side has ≥ [`MIN_QUORUM`] distinct relays *and* strictly more than
+    /// the other. [`resolve_conflict`] returns this `message_id` outright and
+    /// the tie-break is never consulted.
+    Decisive([u8; 32]),
+    /// Both sides reached [`MIN_QUORUM`] and have the *same* distinct-relay
+    /// count. This — and only this — is where a VRF tie-break may be applied.
+    QuorumTie {
+        /// The shared distinct-relay count of the two sides.
+        distinct_relays_each: usize,
+    },
+    /// At least one side is below [`MIN_QUORUM`]. Escalate on-chain; a
+    /// tie-break here would be deciding a conflict nobody corroborated.
+    Insufficient {
+        /// Distinct verified relays for `conflict.envelope_a`.
+        a: usize,
+        /// Distinct verified relays for `conflict.envelope_b`.
+        b: usize,
+    },
+}
+
+fn standing_with_counts(
+    conflict: &Conflict,
+    evidence: &ConflictEvidence,
+) -> (QuorumStanding, usize, usize) {
+    let n_a = count_distinct_valid_relays(
         &evidence.envelope_a_observations,
         conflict.sequence,
         &conflict.envelope_a,
-    );
-    let relays_b = count_distinct_valid_relays(
+    )
+    .len();
+    let n_b = count_distinct_valid_relays(
         &evidence.envelope_b_observations,
         conflict.sequence,
         &conflict.envelope_b,
-    );
+    )
+    .len();
 
-    let n_a = relays_a.len();
-    let n_b = relays_b.len();
+    let standing = if n_a >= MIN_QUORUM && n_a > n_b {
+        QuorumStanding::Decisive(conflict.envelope_a)
+    } else if n_b >= MIN_QUORUM && n_b > n_a {
+        QuorumStanding::Decisive(conflict.envelope_b)
+    } else if n_a >= MIN_QUORUM && n_b >= MIN_QUORUM {
+        // Neither side is strictly greater and both cleared quorum, so the
+        // counts are necessarily equal.
+        QuorumStanding::QuorumTie {
+            distinct_relays_each: n_a,
+        }
+    } else {
+        QuorumStanding::Insufficient { a: n_a, b: n_b }
+    };
 
-    let a_wins = n_a >= MIN_QUORUM && n_a > n_b;
-    let b_wins = n_b >= MIN_QUORUM && n_b > n_a;
+    (standing, n_a, n_b)
+}
 
-    match (a_wins, b_wins) {
-        (true, false) => Ok(conflict.envelope_a),
-        (false, true) => Ok(conflict.envelope_b),
-        _ => Err(SyncEngineError::UnresolvedConflict(format!(
-            "conflict on account {} sequence {} between {} (timestamp {}, {} verified distinct \
-             relay(s)) and {} (timestamp {}, {} verified distinct relay(s)) could not be \
-             resolved off-chain: a winning side needs at least {} distinct corroborating relays \
-             and strictly more than the other side",
-            conflict.source_account,
-            conflict.sequence,
-            hex::encode(conflict.envelope_a),
-            evidence.envelope_a_timestamp,
-            n_a,
-            hex::encode(conflict.envelope_b),
-            evidence.envelope_b_timestamp,
-            n_b,
-            MIN_QUORUM,
+/// Weigh `conflict` on relay-quorum evidence alone, without deciding it. This
+/// is exactly what [`resolve_conflict`] computes internally before it either
+/// returns a winner or an `Err`; callers that need to know *why* a conflict is
+/// unresolved (a quorum-met tie, eligible for a VRF tie-break, vs. an
+/// under-evidenced one that is not) use this.
+pub fn quorum_standing(conflict: &Conflict, evidence: &ConflictEvidence) -> QuorumStanding {
+    standing_with_counts(conflict, evidence).0
+}
+
+/// The complete off-chain decision order for a two-envelope [`Conflict`], with
+/// the VRF tie-break of issue #067 as the explicit last-resort step.
+///
+/// 1. **Relay quorum + strict majority** ([`resolve_conflict`] /
+///    [`quorum_standing`]). If one side wins, that is the answer and the
+///    tie-break is never consulted.
+/// 2. **VRF tie-break** — applied *only* when step 1 found a
+///    [`QuorumStanding::QuorumTie`] (both sides ≥ [`MIN_QUORUM`] distinct
+///    relays and exactly equal: the one case where every deterministic
+///    criterion came out even) *and* `tiebreak` was supplied. The tie-break is
+///    fully verified here — proof valid against the canonical input derived
+///    from the conflict, **and** the evaluator confirmed to be the one
+///    [`crate::conflict::vrf_tiebreak::select_tiebreak_evaluator`] picks from
+///    `candidate_relays`. A quorum-met tie with no (or an invalid) tie-break
+///    still returns `Err(UnresolvedConflict)`.
+/// 3. Anything else ([`QuorumStanding::Insufficient`]) →
+///    `Err(UnresolvedConflict)` → on-chain escalation, with no tie-break.
+///
+/// `candidate_relays` must be the committed identities
+/// ([`RelayVrfIdentity`]) of the relays that corroborated this conflict — in
+/// practice, the [`RelayObservation::relay_pubkey`]s that established the tie,
+/// resolved against each relay's signed `PeerIdentity` record. It is the
+/// evaluator-selection candidate set; passing a different set changes which
+/// evaluator is expected and will reject an otherwise-valid `tiebreak`.
+///
+/// # Errors
+///
+/// [`SyncEngineError::UnresolvedConflict`] for every unresolved case (including
+/// a tie whose supplied `tiebreak` fails verification — the reason is folded
+/// into the message, and the conflict escalates exactly as any other
+/// unresolved one would).
+pub fn resolve_conflict_with_tiebreak(
+    conflict: &Conflict,
+    evidence: &ConflictEvidence,
+    tiebreak: Option<&TiebreakOutcome>,
+    candidate_relays: &[RelayVrfIdentity],
+) -> Result<[u8; 32], SyncEngineError> {
+    match quorum_standing(conflict, evidence) {
+        QuorumStanding::Decisive(winner) => Ok(winner),
+        QuorumStanding::QuorumTie {
+            distinct_relays_each,
+        } => match tiebreak {
+            Some(outcome) => {
+                verify_tiebreak_with_evaluator(conflict, outcome, candidate_relays).map_err(
+                    |e| {
+                        SyncEngineError::UnresolvedConflict(format!(
+                            "conflict on account {} sequence {} is a quorum-met tie \
+                             ({distinct_relays_each} distinct relays each), but the supplied VRF \
+                             tie-break did not verify: {e}",
+                            conflict.source_account, conflict.sequence,
+                        ))
+                    },
+                )?;
+                Ok(outcome.winner)
+            }
+            None => Err(SyncEngineError::UnresolvedConflict(format!(
+                "conflict on account {} sequence {} is a quorum-met tie ({distinct_relays_each} \
+                 distinct relays each); no VRF tie-break was supplied by the selected evaluator, \
+                 so it escalates on-chain",
+                conflict.source_account, conflict.sequence,
+            ))),
+        },
+        QuorumStanding::Insufficient { a, b } => Err(SyncEngineError::UnresolvedConflict(format!(
+            "conflict on account {} sequence {} could not be resolved off-chain: {a} vs {b} \
+             verified distinct relay(s), and a winning side needs at least {MIN_QUORUM}; not a \
+             quorum-met tie, so the VRF tie-break does not apply",
+            conflict.source_account, conflict.sequence,
         ))),
     }
 }
@@ -696,6 +832,146 @@ mod tests {
         let result = resolve_nway_conflict(&conflict, &evidence);
         assert!(matches!(
             result,
+            Err(SyncEngineError::UnresolvedConflict(_))
+        ));
+    }
+
+    // ── quorum_standing + VRF tie-break integration (issue #067) ────────────
+
+    fn evidence_with_relays(conflict: &Conflict, n_a: usize, n_b: usize) -> ConflictEvidence {
+        ConflictEvidence {
+            envelope_a_observations: observations_from_n_distinct_relays(
+                n_a,
+                &conflict.envelope_a,
+                conflict.sequence as u64,
+            ),
+            envelope_b_observations: observations_from_n_distinct_relays(
+                n_b,
+                &conflict.envelope_b,
+                conflict.sequence as u64,
+            ),
+            ..empty_evidence()
+        }
+    }
+
+    #[test]
+    fn test_quorum_standing_distinguishes_tie_from_insufficient() {
+        let conflict = base_conflict();
+
+        assert!(matches!(
+            quorum_standing(&conflict, &evidence_with_relays(&conflict, 3, 1)),
+            QuorumStanding::Decisive(w) if w == conflict.envelope_a
+        ));
+        assert!(matches!(
+            quorum_standing(&conflict, &evidence_with_relays(&conflict, 3, 3)),
+            QuorumStanding::QuorumTie {
+                distinct_relays_each: 3
+            }
+        ));
+        // A 1-vs-1 tie is *not* a quorum-met tie: no tie-break, just escalate.
+        assert!(matches!(
+            quorum_standing(&conflict, &evidence_with_relays(&conflict, 1, 1)),
+            QuorumStanding::Insufficient { a: 1, b: 1 }
+        ));
+        assert!(matches!(
+            quorum_standing(&conflict, &evidence_with_relays(&conflict, 0, 0)),
+            QuorumStanding::Insufficient { a: 0, b: 0 }
+        ));
+    }
+
+    #[test]
+    fn test_resolve_conflict_behaviour_unchanged_by_refactor() {
+        // resolve_conflict must still return exactly what it did before
+        // quorum_standing was factored out.
+        let conflict = base_conflict();
+        assert_eq!(
+            resolve_conflict(&conflict, &evidence_with_relays(&conflict, 3, 1)).unwrap(),
+            conflict.envelope_a
+        );
+        assert!(matches!(
+            resolve_conflict(&conflict, &evidence_with_relays(&conflict, 2, 2)),
+            Err(SyncEngineError::UnresolvedConflict(_))
+        ));
+    }
+
+    #[test]
+    fn test_resolve_conflict_with_tiebreak_decides_a_quorum_met_tie() {
+        use crate::conflict::vrf_tiebreak::{
+            select_tiebreak_evaluator, vrf_tiebreak, RelayVrfIdentity,
+        };
+
+        let conflict = base_conflict();
+        let evidence = evidence_with_relays(&conflict, 3, 3);
+
+        // Committed identities of the relays that corroborated the tie.
+        let relay_signers: Vec<_> = (0..4).map(|_| relay_key()).collect();
+        let candidates: Vec<RelayVrfIdentity> =
+            relay_signers.iter().map(RelayVrfIdentity::derive).collect();
+
+        // No tie-break supplied -> still unresolved.
+        assert!(matches!(
+            resolve_conflict_with_tiebreak(&conflict, &evidence, None, &candidates),
+            Err(SyncEngineError::UnresolvedConflict(_))
+        ));
+
+        // The selected evaluator produces the tie-break.
+        let selected = select_tiebreak_evaluator(&conflict, &candidates)
+            .unwrap()
+            .identity;
+        let selected_key = relay_signers
+            .iter()
+            .find(|k| k.verifying_key().to_bytes() == selected)
+            .unwrap();
+        let outcome = vrf_tiebreak(&conflict, selected_key).unwrap();
+
+        let winner =
+            resolve_conflict_with_tiebreak(&conflict, &evidence, Some(&outcome), &candidates)
+                .unwrap();
+        assert_eq!(winner, outcome.winner);
+        assert!(winner == conflict.envelope_a || winner == conflict.envelope_b);
+    }
+
+    #[test]
+    fn test_resolve_conflict_with_tiebreak_ignores_tiebreak_when_not_a_tie() {
+        use crate::conflict::vrf_tiebreak::{vrf_tiebreak, RelayVrfIdentity};
+
+        let conflict = base_conflict();
+        // Side A wins on quorum outright; a supplied tie-break must not change
+        // or override that.
+        let evidence = evidence_with_relays(&conflict, 3, 1);
+        let rogue = relay_key();
+        let outcome = vrf_tiebreak(&conflict, &rogue).unwrap();
+        let candidates = [RelayVrfIdentity::derive(&rogue)];
+
+        let winner =
+            resolve_conflict_with_tiebreak(&conflict, &evidence, Some(&outcome), &candidates)
+                .unwrap();
+        assert_eq!(winner, conflict.envelope_a);
+    }
+
+    #[test]
+    fn test_resolve_conflict_with_tiebreak_rejects_tie_break_from_wrong_evaluator() {
+        use crate::conflict::vrf_tiebreak::{
+            select_tiebreak_evaluator, vrf_tiebreak, RelayVrfIdentity,
+        };
+
+        let conflict = base_conflict();
+        let evidence = evidence_with_relays(&conflict, 2, 2);
+        let relay_signers: Vec<_> = (0..4).map(|_| relay_key()).collect();
+        let candidates: Vec<RelayVrfIdentity> =
+            relay_signers.iter().map(RelayVrfIdentity::derive).collect();
+
+        let selected = select_tiebreak_evaluator(&conflict, &candidates)
+            .unwrap()
+            .identity;
+        let wrong_key = relay_signers
+            .iter()
+            .find(|k| k.verifying_key().to_bytes() != selected)
+            .unwrap();
+        let outcome = vrf_tiebreak(&conflict, wrong_key).unwrap();
+
+        assert!(matches!(
+            resolve_conflict_with_tiebreak(&conflict, &evidence, Some(&outcome), &candidates),
             Err(SyncEngineError::UnresolvedConflict(_))
         ));
     }
