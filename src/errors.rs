@@ -173,6 +173,15 @@ pub enum SyncEngineError {
         "snapshot schema version {found} is incompatible with this build's expected version {expected}"
     )]
     IncompatibleSnapshotSchemaVersion { found: u32, expected: u32 },
+
+    #[error("TEE signing is requested but no genuine TEE is available on this device")]
+    TeeUnavailable,
+
+    #[error("TEE signing is currently a stub waiting for FFI integration")]
+    TeeSignerUnimplemented,
+
+    #[error("invalid or forged TEE attestation statement: {0}")]
+    InvalidAttestation(String),
 }
 
 impl SyncEngineError {
@@ -236,6 +245,9 @@ impl SyncEngineError {
             SyncEngineError::DecryptionFailed => ErrorClass::Permanent,
             SyncEngineError::ImportTargetNotEmpty => ErrorClass::Permanent,
             SyncEngineError::IncompatibleSnapshotSchemaVersion { .. } => ErrorClass::Permanent,
+            SyncEngineError::TeeUnavailable => ErrorClass::Permanent,
+            SyncEngineError::TeeSignerUnimplemented => ErrorClass::Permanent,
+            SyncEngineError::InvalidAttestation(_) => ErrorClass::Permanent,
 
             // ── RequiresEscalation: needs human/on-chain intervention ──
             SyncEngineError::UnresolvedConflict(_) => ErrorClass::RequiresEscalation,
@@ -308,6 +320,9 @@ mod tests {
                 found: 1,
                 expected: 2,
             },
+            SyncEngineError::TeeUnavailable,
+            SyncEngineError::TeeSignerUnimplemented,
+            SyncEngineError::InvalidAttestation("forged".into()),
         ]
     }
 
