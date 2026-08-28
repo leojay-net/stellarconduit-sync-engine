@@ -170,6 +170,10 @@ name = "vrf_tiebreak_test"
 path = "tests/integration/vrf_tiebreak_test.rs"
 
 [[test]]
+name = "reputation_test"
+path = "tests/integration/reputation_test.rs"
+
+[[test]]
 name = "adversarial_agents_test"
 path = "tests/sim/adversarial_agents_test.rs"
 
