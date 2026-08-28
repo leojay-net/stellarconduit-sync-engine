@@ -1,5 +1,5 @@
-use rand::rngs::OsRng;
 use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
 use stellarconduit_sync_engine::queue::reputation::ReputationTracker;
 
 fn random_peer_id() -> [u8; 32] {
@@ -81,7 +81,7 @@ fn test_simple_sybil_strategy_does_not_trivially_outperform_honest_participation
     }
 
     let attacker_score = tracker.score(&sybil_attacker);
-    
+
     // The attacker's score plunges below 0 due to heavy penalties for invalid transactions.
     assert!(attacker_score < 0);
     assert!(!tracker.is_priority(&sybil_attacker));
