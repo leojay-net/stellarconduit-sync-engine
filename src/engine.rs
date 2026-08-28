@@ -44,8 +44,8 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use stellarconduit_core::message::types::TransactionEnvelope;
 use crate::envelope::secure_signing::KeySigner;
+use stellarconduit_core::message::types::TransactionEnvelope;
 
 use crate::envelope::OfflineEnvelopeBuilder;
 use crate::errors::SyncEngineError;

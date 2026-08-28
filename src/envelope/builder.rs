@@ -84,12 +84,16 @@ impl OfflineEnvelopeBuilder {
         }
 
         let origin_pubkey = signer.public_key();
-        
+
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let message_id = stellarconduit_core::message::envelope::compute_message_id(&origin_pubkey, &tx_xdr, timestamp);
+        let message_id = stellarconduit_core::message::envelope::compute_message_id(
+            &origin_pubkey,
+            &tx_xdr,
+            timestamp,
+        );
         let signature = signer.sign(&message_id)?;
 
         let classical_envelope = TransactionEnvelope {
@@ -138,7 +142,11 @@ pub fn resequence_and_resign(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let message_id = stellarconduit_core::message::envelope::compute_message_id(&origin_pubkey, &new_tx_xdr, timestamp);
+    let message_id = stellarconduit_core::message::envelope::compute_message_id(
+        &origin_pubkey,
+        &new_tx_xdr,
+        timestamp,
+    );
     let signature = signer.sign(&message_id)?;
 
     let classical_envelope = TransactionEnvelope {
@@ -348,7 +356,11 @@ pub fn try_promote(
         .unwrap_or_default()
         .as_secs();
     let tx_xdr = partial.tx_xdr.clone();
-    let message_id = stellarconduit_core::message::envelope::compute_message_id(&origin_pubkey, &tx_xdr, timestamp);
+    let message_id = stellarconduit_core::message::envelope::compute_message_id(
+        &origin_pubkey,
+        &tx_xdr,
+        timestamp,
+    );
     let signature = mesh_signer.sign(&message_id)?;
 
     let classical_envelope = TransactionEnvelope {
@@ -565,9 +577,12 @@ mod tests {
         let old_xdr = fixture("transaction_v1_envelope.b64");
         let key = signing_key();
         let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
-        let old_env = stellarconduit_core::message::envelope::EnvelopeBuilder::new(key.verifying_key().to_bytes(), old_xdr)
-            .ttl(10)
-            .build(&key);
+        let old_env = stellarconduit_core::message::envelope::EnvelopeBuilder::new(
+            key.verifying_key().to_bytes(),
+            old_xdr,
+        )
+        .ttl(10)
+        .build(&key);
 
         let new_env = resequence_and_resign(
             &old_env,
@@ -587,9 +602,12 @@ mod tests {
         let old_xdr = fixture("transaction_v1_envelope.b64");
         let key = signing_key();
         let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
-        let old_env = stellarconduit_core::message::envelope::EnvelopeBuilder::new(key.verifying_key().to_bytes(), old_xdr)
-            .ttl(10)
-            .build(&key);
+        let old_env = stellarconduit_core::message::envelope::EnvelopeBuilder::new(
+            key.verifying_key().to_bytes(),
+            old_xdr,
+        )
+        .ttl(10)
+        .build(&key);
 
         let new_env = resequence_and_resign(
             &old_env,
@@ -606,9 +624,12 @@ mod tests {
         let old_xdr = fixture("transaction_v1_envelope.b64");
         let key = signing_key();
         let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
-        let old_env = stellarconduit_core::message::envelope::EnvelopeBuilder::new(key.verifying_key().to_bytes(), old_xdr)
-            .ttl(10)
-            .build(&key);
+        let old_env = stellarconduit_core::message::envelope::EnvelopeBuilder::new(
+            key.verifying_key().to_bytes(),
+            old_xdr,
+        )
+        .ttl(10)
+        .build(&key);
 
         let new_env = resequence_and_resign(
             &old_env,
@@ -629,9 +650,12 @@ mod tests {
         let old_xdr = fixture("transaction_v1_envelope.b64");
         let key = signing_key();
         let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
-        let old_env = stellarconduit_core::message::envelope::EnvelopeBuilder::new(key.verifying_key().to_bytes(), old_xdr)
-            .ttl(10)
-            .build(&key);
+        let old_env = stellarconduit_core::message::envelope::EnvelopeBuilder::new(
+            key.verifying_key().to_bytes(),
+            old_xdr,
+        )
+        .ttl(10)
+        .build(&key);
 
         let new_env = resequence_and_resign(
             &old_env,
@@ -765,7 +789,8 @@ mod multisig_tests {
         let mut partial = PartiallySignedEnvelope::new("GMULTISIG", 101, "tx_xdr");
 
         let outsider = signing_key();
-        let outsider_signer = crate::envelope::secure_signing::InMemorySigner::new(outsider.clone());
+        let outsider_signer =
+            crate::envelope::secure_signing::InMemorySigner::new(outsider.clone());
         let err = add_signature(&mut partial, &registry, &outsider_signer)
             .expect_err("a key outside the account's signer set must be rejected");
         assert!(matches!(err, SyncEngineError::UnknownMultisigSigner { .. }));

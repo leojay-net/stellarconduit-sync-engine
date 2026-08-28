@@ -161,7 +161,13 @@ async fn test_sequence_reservations_survive_restart() {
     );
 
     engine
-        .queue_payment(account, &signer, fixtures::SEQ_SEQ_4, TxPriority::Normal, 10)
+        .queue_payment(
+            account,
+            &signer,
+            fixtures::SEQ_SEQ_4,
+            TxPriority::Normal,
+            10,
+        )
         .await
         .unwrap();
 
@@ -188,7 +194,13 @@ async fn test_no_sequence_reuse_after_restart() {
     {
         let mut engine = SyncEngine::open(&path).await.unwrap();
         engine
-            .queue_payment(account, &signer, fixtures::REUSE_SEQ_1, TxPriority::Normal, 10)
+            .queue_payment(
+                account,
+                &signer,
+                fixtures::REUSE_SEQ_1,
+                TxPriority::Normal,
+                10,
+            )
             .await
             .unwrap();
         // Dropping here models the process being killed right after the
@@ -204,7 +216,13 @@ async fn test_no_sequence_reuse_after_restart() {
         "the reservation was durably persisted despite the simulated crash"
     );
     engine
-        .queue_payment(account, &signer, fixtures::REUSE_SEQ_2, TxPriority::Normal, 10)
+        .queue_payment(
+            account,
+            &signer,
+            fixtures::REUSE_SEQ_2,
+            TxPriority::Normal,
+            10,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -224,7 +242,13 @@ async fn test_no_double_dispatch_after_restart_post_dispatch() {
     let envelope = {
         let mut engine = SyncEngine::open(&path).await.unwrap();
         engine
-            .queue_payment(account, &signer, fixtures::DISP_SEQ_1, TxPriority::Normal, 10)
+            .queue_payment(
+                account,
+                &signer,
+                fixtures::DISP_SEQ_1,
+                TxPriority::Normal,
+                10,
+            )
             .await
             .unwrap()
     };

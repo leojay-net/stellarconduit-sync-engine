@@ -1,10 +1,10 @@
 use crate::errors::SyncEngineError;
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey, Signature};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 /// A hardware-isolated or memory-backed signer for envelopes.
 ///
 /// # Residual Trust Assumptions
-/// 
+///
 /// 1. **OS/Attestation Delivery:** When using a TEE, the abstraction relies on the host OS
 ///    to faithfully deliver the hardware enclave's attestation statement. If a compromised OS
 ///    can intercept this channel and forge or swap the attestation with one from a different
@@ -66,15 +66,17 @@ impl AttestationStatement {
     /// Verifies this attestation statement against a trusted root public key.
     pub fn verify(&self, trusted_root: &VerifyingKey) -> Result<(), SyncEngineError> {
         let sig = Signature::from_bytes(&self.signature);
-        trusted_root
-            .verify(&self.payload, &sig)
-            .map_err(|_| SyncEngineError::InvalidAttestation("signature verification failed".into()))?;
-        
+        trusted_root.verify(&self.payload, &sig).map_err(|_| {
+            SyncEngineError::InvalidAttestation("signature verification failed".into())
+        })?;
+
         // For testing purposes, we define that if the payload explicitly starts with "forged",
         // it fails validation even if the signature happens to be technically correct (though
         // it shouldn't be for a forged payload, but we enforce this defensively).
         if self.payload.starts_with(b"forged") {
-            return Err(SyncEngineError::InvalidAttestation("payload indicates a forged attestation".into()));
+            return Err(SyncEngineError::InvalidAttestation(
+                "payload indicates a forged attestation".into(),
+            ));
         }
 
         Ok(())
@@ -91,7 +93,11 @@ pub struct TeeSigner {
 impl TeeSigner {
     /// Attempt to acquire a TEE-backed signer. If genuine TEE is unavailable,
     /// this must fail hard, not silently fall back to software.
-    pub fn try_new(public_key: [u8; 32], attestation: Vec<u8>, tee_available: bool) -> Result<Self, SyncEngineError> {
+    pub fn try_new(
+        public_key: [u8; 32],
+        attestation: Vec<u8>,
+        tee_available: bool,
+    ) -> Result<Self, SyncEngineError> {
         if !tee_available {
             return Err(SyncEngineError::TeeUnavailable);
         }
@@ -131,11 +137,11 @@ mod tests {
     fn test_in_memory_signer_produces_valid_signatures() {
         let key = SigningKey::generate(&mut OsRng);
         let verifying_key = key.verifying_key();
-        
+
         let signer = InMemorySigner::new(key);
         let msg = b"test payload";
         let sig_bytes = signer.sign(msg).unwrap();
-        
+
         let signature = Signature::from_bytes(&sig_bytes);
         assert!(verifying_key.verify(msg, &signature).is_ok());
         assert!(!signer.is_tee());
@@ -152,10 +158,10 @@ mod tests {
     fn test_valid_attestation_verifies() {
         let root_key = SigningKey::generate(&mut OsRng);
         let root_vk = root_key.verifying_key();
-        
+
         let payload = b"genuine hardware attestation".to_vec();
         let signature = root_key.sign(&payload).to_bytes();
-        
+
         let stmt = AttestationStatement { payload, signature };
         assert!(stmt.verify(&root_vk).is_ok());
     }
@@ -164,20 +170,32 @@ mod tests {
     fn test_forged_attestation_is_rejected() {
         let root_key = SigningKey::generate(&mut OsRng);
         let root_vk = root_key.verifying_key();
-        
+
         // Signed by a different (untrusted) key
         let attacker_key = SigningKey::generate(&mut OsRng);
         let payload = b"genuine hardware attestation".to_vec();
         let forged_sig = attacker_key.sign(&payload).to_bytes();
-        
-        let stmt = AttestationStatement { payload, signature: forged_sig };
-        assert!(matches!(stmt.verify(&root_vk), Err(SyncEngineError::InvalidAttestation(_))));
-        
+
+        let stmt = AttestationStatement {
+            payload,
+            signature: forged_sig,
+        };
+        assert!(matches!(
+            stmt.verify(&root_vk),
+            Err(SyncEngineError::InvalidAttestation(_))
+        ));
+
         // Valid signature but forged payload content
         let bad_payload = b"forged hardware attestation".to_vec();
         let bad_sig = root_key.sign(&bad_payload).to_bytes();
-        
-        let bad_stmt = AttestationStatement { payload: bad_payload, signature: bad_sig };
-        assert!(matches!(bad_stmt.verify(&root_vk), Err(SyncEngineError::InvalidAttestation(_))));
+
+        let bad_stmt = AttestationStatement {
+            payload: bad_payload,
+            signature: bad_sig,
+        };
+        assert!(matches!(
+            bad_stmt.verify(&root_vk),
+            Err(SyncEngineError::InvalidAttestation(_))
+        ));
     }
 }
