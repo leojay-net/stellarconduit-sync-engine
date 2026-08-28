@@ -89,6 +89,25 @@ pub fn detect_conflicts(slots: &[QueuedSlot]) -> Vec<Conflict> {
             }
         }
     }
+    // Sort so the result is a pure function of the *set* of slots, not of
+    // `HashMap` iteration order (which depends on insertion order and on
+    // `RandomState`). Seeded simulation / adversarial race agents need a
+    // byte-identical conflict list for the same logical input; without this
+    // the same seed can produce different traces across process runs.
+    conflicts.sort_by(|a, b| {
+        (
+            a.source_account.as_str(),
+            a.sequence,
+            a.envelope_a,
+            a.envelope_b,
+        )
+            .cmp(&(
+                b.source_account.as_str(),
+                b.sequence,
+                b.envelope_a,
+                b.envelope_b,
+            ))
+    });
     conflicts
 }
 
@@ -138,6 +157,15 @@ pub fn detect_nway_conflicts(slots: &[QueuedSlot]) -> Vec<NWayConflict> {
             });
         }
     }
+    // Same rationale as [`detect_conflicts`]: stabilize against HashMap
+    // iteration order so seeded sims reproduce bit-identically.
+    conflicts.sort_by(|a, b| {
+        (a.source_account.as_str(), a.sequence, &a.message_ids).cmp(&(
+            b.source_account.as_str(),
+            b.sequence,
+            &b.message_ids,
+        ))
+    });
     conflicts
 }
 

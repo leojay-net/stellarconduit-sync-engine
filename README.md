@@ -310,6 +310,21 @@ cargo test --test '*'
 
 These run as part of the normal test suite — no separate command is needed.
 
+### Adversarial Byzantine simulation (`#070`)
+
+`src/sim/` is a seeded simulation harness (stable API for `#049`-style work) plus three pluggable Byzantine agents — forged relay proofs, stale observation replay, and deliberate same-tick races. Same seed ⇒ identical execution trace.
+
+```bash
+# Required determinism + regression tests
+cargo test --test adversarial_agents_test
+
+# Bounded CI sweep (512 seeds / 60s in GitHub Actions; override locally)
+ADVERSARIAL_SWEEP_SEEDS=2000 ADVERSARIAL_SWEEP_BUDGET_SECS=120 \
+  cargo test --test adversarial_sweep -- --nocapture
+```
+
+The race agent is what surfaced that `detect_conflicts` / `detect_nway_conflicts` used to return `HashMap`-iteration order (insertion-order dependent). Both now sort their output so seeded traces stay reproducible — see `test_race_agent_detect_conflicts_output_is_insertion_order_independent`.
+
 ### Fuzz Testing
 
 A [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) target lives in [`fuzz/`](fuzz/) and exercises `rmp_serde::from_slice::<TransactionEnvelope>`, the deserialization path `SyncEngineDb` uses to read queued envelopes back out of SQLite (see `src/storage/db.rs`). Envelope bytes are meant to be ones this crate wrote itself, but corrupted or adversarial input should be rejected with an error, never cause a panic — this matters more once database export/import (for device migration) makes it possible to load a `SyncEngineDb` file from an untrusted source.
