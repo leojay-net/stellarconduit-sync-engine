@@ -54,6 +54,22 @@ rmp-serde = "1.1"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 sha2 = "0.10.8"
 
+# Verifiable Random Function for the last-resort conflict tie-break (issue
+# #067, `src/conflict/vrf_tiebreak.rs`). `schnorrkel` is the VRF behind
+# Substrate/Polkadot BABE block production — a direct analogue of a
+# deterministic "who wins this slot" lottery — is w3f-maintained and has been
+# externally audited, and is built on the same `curve25519-dalek` 4.x backend
+# `ed25519-dalek` already pulls in, so it adds no second elliptic-curve
+# implementation to the build (the mobile-wallet size constraint noted for
+# `stellar-xdr` above applies just as much here). The evaluator's VRF keypair
+# is derived deterministically from its existing ed25519 signing seed via
+# `MiniSecretKey::expand(ExpansionMode::Ed25519)`, so one relay identity maps
+# to exactly one VRF key — nothing new to distribute or register. Default
+# features keep `getrandom` on, which schnorrkel's proof-blinding nonce
+# needs; the VRF *output* (and therefore the tie-break winner) stays fully
+# deterministic — only the proof's zero-knowledge blinding is randomized.
+schnorrkel = "0.11"
+
 # Encryption at rest for sensitive database columns
 # Uses AES-256-GCM for authenticated encryption with additional data (AEAD)
 aes-gcm = "0.10"
@@ -148,6 +164,10 @@ path = "tests/integration/engine_restart_test.rs"
 [[test]]
 name = "cli_test"
 path = "tests/integration/cli_test.rs"
+
+[[test]]
+name = "vrf_tiebreak_test"
+path = "tests/integration/vrf_tiebreak_test.rs"
 
 [[test]]
 name = "adversarial_agents_test"

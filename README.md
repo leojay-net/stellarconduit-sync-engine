@@ -112,7 +112,8 @@ Detects and (eventually) resolves double-spend conflicts arising from split mesh
 
 **Key responsibilities:**
 - `detector`: structural detection — two different envelopes claiming the same (account, sequence) slot can never both settle on-chain
-- `resolver`: **the hard, unsolved centerpiece** — deterministic off-chain resolution using timestamps, `RelayChainProof`s, and relay-node consensus. Currently every conflict falls through to `SyncEngineError::UnresolvedConflict`.
+- `resolver`: **the hard centerpiece** — deterministic off-chain resolution from a Sybil-resistant quorum of verified `RelayChainProof`s. `quorum_standing` exposes *why* a conflict is unresolved; conflicts it still can't settle escalate on-chain.
+- `vrf_tiebreak`: last-resort step for a genuine quorum-met tie — a `schnorrkel` VRF, evaluated by a deterministically-selected relay (never a conflicting party), producing a tie-break that is unpredictable in advance yet independently verifiable by anyone.
 
 ---
 

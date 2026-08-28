@@ -75,6 +75,14 @@ pub enum SyncEngineError {
     #[error("conflict between envelopes could not be resolved off-chain: {0}")]
     UnresolvedConflict(String),
 
+    /// Returned by `crate::conflict::vrf_tiebreak` when a VRF tie-break proof
+    /// is malformed, fails verification, or was produced by a party other than
+    /// the deterministically selected evaluator. The tie-break is the
+    /// last-resort step of conflict resolution (issue #067); a bad one is a
+    /// caller-data / protocol-deviation failure, not something to retry.
+    #[error("VRF conflict tie-break is invalid: {0}")]
+    VrfTiebreak(String),
+
     /// Returned when queuing an Emergency-tier envelope would push the
     /// device past its configured spending guard (see
     /// `crate::queue::priority::EmergencyGuardConfig`). This is a soft,
@@ -192,6 +200,7 @@ impl SyncEngineError {
     /// | `DuplicateInFlight` | Permanent | The same message was acquired into the dispatch window twice without an intervening release. This is a caller bug; retrying identical inputs reproduces it. |
     /// | `InvalidDispatchWindow` | Permanent | The window configuration violates an invariant (zero capacity or zero timeout). Fix the configuration and construct again. |
     /// | `UnresolvedConflict` | RequiresEscalation | Two envelopes compete for the same account/sequence slot and could not be resolved off-chain. Neither retrying nor giving up is correct — the dispute must be escalated to the on-chain `dispute-resolver` contract (see issue #002). |
+    /// | `VrfTiebreak` | Permanent | A supplied VRF tie-break proof is malformed, fails verification, or came from the wrong evaluator. The same bytes will fail the same way on every attempt; the resolution flow treats a tie with no valid tie-break as an ordinary `UnresolvedConflict` and escalates. |
     /// | `EmergencyQueueLimitExceeded` | RequiresEscalation | The spending guard has tripped. A simple retry without user re-confirmation would be a security bypass. The embedding wallet must surface this to the user (biometric re-auth or explicit override) before queuing is retried. |
     /// | `UnknownMultisigSigner` | Permanent | The presented signing key is not in the account's authorised signer set. No retry will change the signer registry without an explicit key-management operation. |
     /// | `MultisigThresholdNotMet` | Permanent | The accumulated signer weight is below the required threshold. In this context the error means promotion was attempted prematurely; more signatures are needed, which is a caller flow issue, not a transient I/O problem. |
@@ -208,6 +217,7 @@ impl SyncEngineError {
             SyncEngineError::NoSequenceReserved(_) => ErrorClass::Permanent,
             SyncEngineError::SequenceOutOfOrder { .. } => ErrorClass::Permanent,
             SyncEngineError::InvalidEnvelope(_) => ErrorClass::Permanent,
+            SyncEngineError::VrfTiebreak(_) => ErrorClass::Permanent,
             SyncEngineError::XdrParse(_) => ErrorClass::Permanent,
             SyncEngineError::SourceAccountMismatch { .. } => ErrorClass::Permanent,
             SyncEngineError::SequenceMismatch { .. } => ErrorClass::Permanent,
@@ -269,6 +279,7 @@ mod tests {
                 to: "settled".into(),
             },
             SyncEngineError::UnresolvedConflict("slot 42".into()),
+            SyncEngineError::VrfTiebreak("bad proof".into()),
             SyncEngineError::EmergencyQueueLimitExceeded {
                 current: 3,
                 max: 3,
@@ -380,6 +391,14 @@ mod tests {
     fn test_invalid_envelope_is_permanent() {
         assert_eq!(
             SyncEngineError::InvalidEnvelope("malformed".into()).classify(),
+            ErrorClass::Permanent
+        );
+    }
+
+    #[test]
+    fn test_vrf_tiebreak_is_permanent() {
+        assert_eq!(
+            SyncEngineError::VrfTiebreak("proof failed verification".into()).classify(),
             ErrorClass::Permanent
         );
     }
