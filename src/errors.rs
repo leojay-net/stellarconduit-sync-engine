@@ -148,6 +148,13 @@ pub enum SyncEngineError {
     #[error("post-quantum signature verification failed")]
     PqVerificationFailed,
 
+    /// Returned when at-rest envelope compression (issue #56) or its
+    /// compression-oracle mitigation (issue #93) cannot produce or decode a
+    /// storage frame — e.g. a corrupt frame header, an invalid DEFLATE stream,
+    /// or an at-rest blob that exceeds the decompression-bomb size cap.
+    #[error("at-rest compression error: {0}")]
+    CompressionError(String),
+
     /// Returned when encryption or decryption operations fail.
     #[error("encryption error: {0}")]
     EncryptionError(String),
@@ -228,6 +235,7 @@ impl SyncEngineError {
     /// | `SqliteError` | Transient | Raw `rusqlite` errors (e.g. `SQLITE_BUSY`, `SQLITE_LOCKED`) are similarly caused by disk/locking contention and are generally safe to retry. Callers that need to distinguish truly fatal SQLite errors (e.g. corruption) may inspect the inner `rusqlite::Error` further, but the default classification is Transient. |
     /// | `SerializationError` | Permanent | A value could not be encoded to MessagePack. This reflects a type-system mismatch or an unencodable value; retrying the same data will produce the same error. |
     /// | `DeserializationError` | Permanent | Stored bytes could not be decoded. The bytes are corrupted or were written by an incompatible schema version. Retrying the same read will not repair the data. |
+    /// | `CompressionError` | Permanent | An at-rest compression frame (issue #56 / #93) could not be built or decoded: bad magic, truncated header, invalid DEFLATE stream, or an oversized decompression. The same stored bytes fail identically on every attempt. |
     /// | `ImportTargetNotEmpty` | Permanent | `import_snapshot`'s documented policy refuses a non-empty target. Retrying the identical call against the same database will always hit the same refusal; the caller must choose a fresh database. |
     /// | `IncompatibleSnapshotSchemaVersion` | Permanent | The snapshot was produced by a different schema version than this build expects. Retrying the same import will reproduce the same mismatch; a migration path is needed instead. |
     #[deny(unreachable_patterns)]
@@ -252,6 +260,7 @@ impl SyncEngineError {
             SyncEngineError::SerializationError(_) => ErrorClass::Permanent,
             SyncEngineError::DeserializationError(_) => ErrorClass::Permanent,
             SyncEngineError::PqVerificationFailed => ErrorClass::Permanent,
+            SyncEngineError::CompressionError(_) => ErrorClass::Permanent,
             SyncEngineError::EncryptionError(_) => ErrorClass::Permanent,
             SyncEngineError::EncryptionKeyMismatch => ErrorClass::Permanent,
             SyncEngineError::DecryptionFailed => ErrorClass::Permanent,
@@ -325,6 +334,7 @@ mod tests {
             SyncEngineError::SerializationError(rmp_serde::encode::Error::UnknownLength),
             SyncEngineError::DeserializationError(rmp_serde::decode::Error::Syntax("test".into())),
             SyncEngineError::PqVerificationFailed,
+            SyncEngineError::CompressionError("bad frame magic".into()),
             SyncEngineError::EncryptionError("test encryption error".into()),
             SyncEngineError::EncryptionKeyMismatch,
             SyncEngineError::DecryptionFailed,
