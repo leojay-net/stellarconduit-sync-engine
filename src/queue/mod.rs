@@ -1,4 +1,5 @@
 pub mod dispatch;
+pub mod expiry_policy;
 pub mod priority;
 pub mod reputation;
 pub mod sequence;
@@ -6,6 +7,7 @@ pub mod spendable;
 pub mod vdf_ordering;
 
 pub use dispatch::{DispatchWindow, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TIMEOUT_SECS};
+pub use expiry_policy::{ExpiryPolicy, MAX_EXPIRY_SECS};
 pub use priority::{EmergencyGuardConfig, OutboundTxQueue, TxPriority};
 pub use sequence::{MultisigAccountRegistry, ReconciliationOutcome, SequenceReservationManager};
 pub use spendable::{estimate_spendable, QueuedEnvelopeSpend};
